@@ -557,9 +557,16 @@ def open_attached_driver(open_data: Dict[str, Any]) -> webdriver.Chrome:
     from selenium.webdriver.chrome.service import Service
     options = webdriver.ChromeOptions()
     options.debugger_address = debugger_address
+    try:
+        options.page_load_strategy = 'eager'
+    except Exception:
+        pass
     service = Service(executable_path=driver_path)
     driver = webdriver.Chrome(service=service, options=options)
-    driver.set_page_load_timeout(120)
+    try:
+        driver.set_page_load_timeout(60)
+    except Exception:
+        pass
     return driver
 
 
@@ -589,11 +596,17 @@ def proxy_payload(host: str, port: str, username: Optional[str], password: Optio
         'proxyType': 'socks5',
         'host': host,
         'port': str(port),
+        'proxyHost': host,
+        'proxyPort': str(port),
     }
     if username:
         p['proxyUserName'] = username
     if password:
         p['proxyPassword'] = password
+    if username and password:
+        p['proxy'] = f"socks5://{username}:{password}@{host}:{port}"
+    else:
+        p['proxy'] = f"socks5://{host}:{port}"
     return p
 
 
@@ -736,19 +749,19 @@ def perform_registration(
     except Exception as e:
         return False, str(e)
     finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        try:
+            client.close_browser(browser_id)
+        except Exception:
+            pass
         if not result_ok:
             try:
-                driver.quit()
-            except Exception:
-                pass
-            try:
-                client.close_browser(browser_id)
                 client.delete_browser(browser_id)
             except Exception:
                 pass
-        else:
-            # 成功保留窗口以便人工检查
-            pass
 
 
 def run_batch(
@@ -760,6 +773,7 @@ def run_batch(
     concurrency: int,
     timeout_ms: int,
     poll_ms: int,
+    max_rounds: int = 5,
     logger: Optional[Any] = None,
     stop_event: Optional[threading.Event] = None,
     progress_cb: Optional[Any] = None,
@@ -818,7 +832,8 @@ def run_batch(
         return idx, ok, msg
 
     pending_idx = [i for i, r in enumerate(rows) if str(r.get('status', '')).strip() != 'good']
-    while pending_idx:
+    rounds = 0
+    while pending_idx and rounds < max_rounds:
         if stop_event and stop_event.is_set():
             break
         futures = []
@@ -839,6 +854,7 @@ def run_batch(
                     pass
         write_rows_csv(input_path, rows)
         pending_idx = [i for i, r in enumerate(rows) if str(r.get('status', '')).strip() != 'good']
+        rounds += 1
         if pending_idx:
             time.sleep(3)
 
@@ -846,16 +862,19 @@ def run_batch(
 def main() -> None:
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument('--input', default='/Users/jerry/Documents/GitHub/KL_AI/kl-mail.csv')
-    p.add_argument('--xpaths', default='/Users/jerry/Documents/GitHub/KL_AI/kling_xpaths.json')
+    import os
+    base_dir = os.path.dirname(__file__)
+    p.add_argument('--input', default=os.path.join(base_dir, 'kl-mail.csv'))
+    p.add_argument('--xpaths', default=os.path.join(base_dir, 'kling_xpaths.json'))
     p.add_argument('--platform-url', default='https://klingai.com/global')
     p.add_argument('--bitbrowser-url', default='http://127.0.0.1:54345')
     p.add_argument('--bitbrowser-secret', default=os.environ.get('BITBROWSER_SECRET'))
     p.add_argument('--concurrency', type=int, default=1)
     p.add_argument('--timeout-ms', type=int, default=100000)
     p.add_argument('--poll-ms', type=int, default=500)
+    p.add_argument('--max-rounds', type=int, default=5)
     args = p.parse_args()
-    run_batch(args.input, args.xpaths, args.platform_url, args.bitbrowser_url, args.bitbrowser_secret, args.concurrency, args.timeout_ms, args.poll_ms)
+    run_batch(args.input, args.xpaths, args.platform_url, args.bitbrowser_url, args.bitbrowser_secret, args.concurrency, args.timeout_ms, args.poll_ms, args.max_rounds)
 
 
 if __name__ == '__main__':

@@ -15,14 +15,16 @@ class App(ctk.CTk):
         self.geometry('1100x800')
         ctk.set_appearance_mode('dark')
         ctk.set_default_color_theme('blue')
-        self.csv_var = tkinter.StringVar(value='/Users/jerry/Documents/GitHub/KL_AI/kl-mail.csv')
-        self.xpath_var = tkinter.StringVar(value='/Users/jerry/Documents/GitHub/KL_AI/kling_xpaths.json')
+        base_dir = os.path.dirname(__file__)
+        self.csv_var = tkinter.StringVar(value=os.path.join(base_dir, 'kl-mail.csv'))
+        self.xpath_var = tkinter.StringVar(value=os.path.join(base_dir, 'kling_xpaths.json'))
         self.bit_url_var = tkinter.StringVar(value='http://127.0.0.1:54345')
         self.bit_secret_var = tkinter.StringVar(value=os.environ.get('BITBROWSER_SECRET') or '')
         self.platform_url_var = tkinter.StringVar(value='https://klingai.com/global')
         self.concurrent_var = tkinter.IntVar(value=1)
         self.timeout_ms_var = tkinter.IntVar(value=100000)
         self.poll_ms_var = tkinter.IntVar(value=500)
+        self.max_rounds_var = tkinter.IntVar(value=5)
         self.enable_xpath_var = tkinter.BooleanVar(value=True)
         self.cnt_total_var = tkinter.StringVar(value='0')
         self.cnt_success_var = tkinter.StringVar(value='0')
@@ -81,6 +83,8 @@ class App(ctk.CTk):
         ctk.CTkLabel(cfg, text='XPath文件').grid(row=4, column=0, padx=6, pady=6, sticky='w')
         ctk.CTkEntry(cfg, textvariable=self.xpath_var, width=620).grid(row=4, column=1, padx=6, pady=6, sticky='w', columnspan=2)
         ctk.CTkButton(cfg, text='浏览', command=self.choose_xpath, width=80).grid(row=4, column=3, padx=6, pady=6, sticky='w')
+        ctk.CTkLabel(cfg, text='最大轮数').grid(row=5, column=0, padx=6, pady=6, sticky='w')
+        ctk.CTkEntry(cfg, textvariable=self.max_rounds_var, width=120).grid(row=5, column=1, padx=6, pady=6, sticky='w')
 
         ctk.CTkLabel(self, text='运行日志').pack(anchor='w', padx=12)
         self.log = ctk.CTkTextbox(self, height=220, width=920)
@@ -154,6 +158,7 @@ class App(ctk.CTk):
             int(self.concurrent_var.get()),
             int(self.timeout_ms_var.get()),
             int(self.poll_ms_var.get()),
+            int(self.max_rounds_var.get()),
         )
         def run():
             try:
@@ -224,6 +229,7 @@ class App(ctk.CTk):
             'concurrency': int(self.concurrent_var.get()),
             'timeout_ms': int(self.timeout_ms_var.get()),
             'poll_ms': int(self.poll_ms_var.get()),
+            'max_rounds': int(self.max_rounds_var.get()),
         }
         try:
             with open('gui_config.json', 'w', encoding='utf-8') as f:
@@ -233,14 +239,16 @@ class App(ctk.CTk):
             self.append_log(str(e))
 
     def reset_defaults(self):
-        self.csv_var.set('/Users/jerry/Documents/GitHub/KL_AI/kl-mail.csv')
-        self.xpath_var.set('/Users/jerry/Documents/GitHub/KL_AI/kling_xpaths.json')
+        base_dir = os.path.dirname(__file__)
+        self.csv_var.set(os.path.join(base_dir, 'kl-mail.csv'))
+        self.xpath_var.set(os.path.join(base_dir, 'kling_xpaths.json'))
         self.bit_url_var.set('http://127.0.0.1:54345')
         self.bit_secret_var.set(os.environ.get('BITBROWSER_SECRET') or '')
         self.platform_url_var.set('https://klingai.com/global')
         self.concurrent_var.set(1)
         self.timeout_ms_var.set(100000)
         self.poll_ms_var.set(500)
+        self.max_rounds_var.set(5)
 
     def _load_config(self):
         try:
@@ -254,6 +262,7 @@ class App(ctk.CTk):
             self.concurrent_var.set(int(cfg.get('concurrency', self.concurrent_var.get())))
             self.timeout_ms_var.set(int(cfg.get('timeout_ms', self.timeout_ms_var.get())))
             self.poll_ms_var.set(int(cfg.get('poll_ms', self.poll_ms_var.get())))
+            self.max_rounds_var.set(int(cfg.get('max_rounds', self.max_rounds_var.get())))
             self.concurrent_sel_var.set(str(self.concurrent_var.get()))
             self.poll_sel_var.set(str(self.poll_ms_var.get()))
             self.append_log('已加载上次保存的参数')

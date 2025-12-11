@@ -1,5 +1,5 @@
-{"language_menu": "//*[@class='flex items-center gap-6']",
-  "english_option": "//*[text()='English']",
+{"language_menu": "//*[text()='English']",
+  "english_option": "(//*[@class='el-dropdown-menu__item'])[1]",
   "Creative Studio": "//*[text()='Creative Studio']",
   "More Tools": "//*[text()='More Tools']",
   "signin_btn": "//*[text()='Sign In']",
