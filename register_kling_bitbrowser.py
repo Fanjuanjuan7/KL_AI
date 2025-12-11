@@ -214,7 +214,6 @@ def solve_slider(driver: webdriver.Remote, xpaths: Dict[str, str], timeout_ms: i
         if element_exists(driver, xpaths['slider_iframe'], iframe_probe_ms, poll_ms):
             iframe = driver.find_element(By.XPATH, xpaths['slider_iframe'])
             driver.switch_to.frame(iframe)
-        offsets = [0, -50, -40, -30, 30, 40, 50, -20, 20, -10]
         for i in range(10):
             # 每次尝试重新定位容器与句柄，避免刷新后引用失效
             try:
@@ -262,9 +261,9 @@ def solve_slider(driver: webdriver.Remote, xpaths: Dict[str, str], timeout_ms: i
                             handle_w = hw
                 except Exception:
                     pass
-                dist = 218 + offsets[i % len(offsets)]
+                dist = 218
             except Exception:
-                dist = 120
+                dist = 218
             try:
                 actions = ActionChains(driver)
                 if handle is not None:
