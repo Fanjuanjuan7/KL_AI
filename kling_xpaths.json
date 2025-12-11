@@ -10,7 +10,7 @@
   "Confirm Password": "//*[@placeholder='Confirm Password']",
   "next_btn": "//*[@class='inner' and text()='Next']",
   "slider_iframe": "//iframe[contains(@src, 'captcha')]",
-  "slider_handle": "//*[@class='btn-icon']",
+  "slider_handle": "//*[contains(@class,'slider-btn')]",
   "slider_container": "//div[contains(@class, 'slider')]",
   "code_input": "//*[@style=' font-size: 28px; border-radius: 8px; background-color: #efefef; color: black; font-weight: 600; text-align: center; padding: 12px 24px; border: solid 1px black; ']",
   "code_url_element": "//*[@placeholder='Verification Code']",

@@ -128,6 +128,10 @@ class App(ctk.CTk):
     def append_log(self, s: str):
         self.log.insert('end', s + '\n')
         self.log.see('end')
+        try:
+            print(s)
+        except Exception:
+            pass
 
     def progress_cb(self, data):
         self.cnt_total_var.set(str(data.get('total',0)))
@@ -185,22 +189,17 @@ class App(ctk.CTk):
                         bid = d
                     if not bid:
                         bid = data.get('id')
-                    if not bid:
-                        self.append_log('连接失败: 未返回id')
-                        return False
-                    r2 = requests.post(f"{url_base}/browser/open", headers=headers, data=json.dumps({'id':bid}), timeout=10)
-                    r2.raise_for_status()
-                    data2 = r2.json().get('data',{})
-                    self.append_log(f"连接成功: {data2}")
-                    try:
-                        requests.post(f"{url_base}/browser/close", headers=headers, data=json.dumps({'id':bid}), timeout=5)
-                    except Exception:
-                        pass
+                    if bid:
+                        try:
+                            requests.post(f"{url_base}/browser/delete", headers=headers, data=json.dumps({'id':bid}), timeout=5)
+                        except Exception:
+                            pass
                     return True
                 except Exception as e:
                     self.append_log(f"连接尝试失败: {url_base} -> {e}")
                     return False
             if try_open(base):
+                self.append_log(f"接口可用: {base}")
                 return
             ports = [54345, 54346, 54321, 54322, 50325, 55555]
             for p in ports:

@@ -148,22 +148,27 @@ def write_rows_csv(input_path: str, rows: List[Dict[str, Any]]) -> None:
 
 def element_exists(driver: webdriver.Remote, xpath: str, timeout_ms: int, poll_ms: int) -> bool:
     try:
-        WebDriverWait(driver, timeout_ms / 1000.0, poll_frequency=poll_ms / 1000.0).until(EC.presence_of_element_located((By.XPATH, xpath)))
+        eff_timeout = min(timeout_ms, 12000)
+        eff_poll = max(0.2, poll_ms / 1000.0)
+        WebDriverWait(driver, eff_timeout / 1000.0, poll_frequency=eff_poll).until(EC.presence_of_element_located((By.XPATH, xpath)))
         return True
     except Exception:
         return False
 
 
 def find_click(driver: webdriver.Remote, xpath: str, timeout_ms: int, poll_ms: int) -> None:
-    WebDriverWait(driver, timeout_ms / 1000.0, poll_frequency=poll_ms / 1000.0).until(EC.element_to_be_clickable((By.XPATH, xpath))).click()
+    eff_timeout = min(timeout_ms, 10000)
+    WebDriverWait(driver, eff_timeout / 1000.0, poll_frequency=poll_ms / 1000.0).until(EC.element_to_be_clickable((By.XPATH, xpath))).click()
 
 
 def find_click_any(driver: webdriver.Remote, xpath: str, timeout_ms: int, poll_ms: int) -> None:
     try:
-        WebDriverWait(driver, timeout_ms / 1000.0, poll_frequency=poll_ms / 1000.0).until(EC.element_to_be_clickable((By.XPATH, xpath))).click()
+        eff_timeout = min(timeout_ms, 10000)
+        WebDriverWait(driver, eff_timeout / 1000.0, poll_frequency=poll_ms / 1000.0).until(EC.element_to_be_clickable((By.XPATH, xpath))).click()
         return
     except Exception:
-        el = WebDriverWait(driver, timeout_ms / 1000.0, poll_frequency=poll_ms / 1000.0).until(EC.presence_of_element_located((By.XPATH, xpath)))
+        eff_timeout = min(timeout_ms, 10000)
+        el = WebDriverWait(driver, eff_timeout / 1000.0, poll_frequency=poll_ms / 1000.0).until(EC.presence_of_element_located((By.XPATH, xpath)))
         driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
         try:
             el.click()
@@ -193,51 +198,122 @@ def _human_drag_track(distance: int, duration_ms: int = 900, jitter_px: int = 1,
 
 
 def solve_slider(driver: webdriver.Remote, xpaths: Dict[str, str], timeout_ms: int, poll_ms: int) -> bool:
-    if not element_exists(driver, xpaths['slider_container'], timeout_ms, poll_ms):
-        return True
+    # 等待滑块弹窗出现（容器或 iframe 任一）
+    appear_wait_ms = min(timeout_ms, 25000)
+    start = time.time()
+    while (time.time() - start) * 1000 < appear_wait_ms:
+        if element_exists(driver, xpaths['slider_iframe'], 800, poll_ms) or element_exists(driver, xpaths['slider_container'], 800, poll_ms):
+            break
+        time.sleep(max(0.1, poll_ms/1000.0))
+    else:
+        # 长时间未出现滑块，不视为成功，返回 False 以便上层处理
+        return False
     ok_xpath = xpaths.get('code_url_element') or xpaths.get('next_btn') or xpaths.get('password_input')
     try:
-        iframe_probe_ms = min(timeout_ms, 3000)
+        iframe_probe_ms = min(timeout_ms, 6000)
         if element_exists(driver, xpaths['slider_iframe'], iframe_probe_ms, poll_ms):
             iframe = driver.find_element(By.XPATH, xpaths['slider_iframe'])
             driver.switch_to.frame(iframe)
-        container = driver.find_element(By.XPATH, xpaths['slider_container'])
-        handle_wait_ms = min(timeout_ms, 8000)
-        handle = WebDriverWait(driver, handle_wait_ms / 1000.0, poll_frequency=poll_ms / 1000.0).until(EC.presence_of_element_located((By.XPATH, xpaths['slider_handle'])))
-        width = container.size.get('width') or 200
-        handle_w = handle.size.get('width') or 20
-        base_dist = max(60, int(width - handle_w - 12))
-        candidates = [base_dist, base_dist - 25, base_dist - 45, base_dist + 15, base_dist + 30]
-        for dist in candidates:
+        offsets = [0, -50, -40, -30, 30, 40, 50, -20, 20, -10]
+        for i in range(10):
+            # 每次尝试重新定位容器与句柄，避免刷新后引用失效
             try:
-                actions = ActionChains(driver)
-                actions.move_to_element(handle).click_and_hold(handle)
-                track = _human_drag_track(max(50, dist))
-                for i, dx in enumerate(track):
-                    actions.move_by_offset(dx, 0)
-                actions.release().perform()
+                # 确保位于正确的文档或iframe中
                 try:
                     driver.switch_to.default_content()
                 except Exception:
                     pass
-                if ok_xpath and element_exists(driver, ok_xpath, timeout_ms, poll_ms):
+                if element_exists(driver, xpaths['slider_iframe'], 1500, poll_ms):
+                    try:
+                        iframe = driver.find_element(By.XPATH, xpaths['slider_iframe'])
+                        driver.switch_to.frame(iframe)
+                    except Exception:
+                        pass
+                container = None
+                for xp in [xpaths['slider_container'], "//*[contains(@class,'slider-shadow')]", "//*[contains(@class,'kwai-captcha-slider-wrapper')]"]:
+                    try:
+                        container = driver.find_element(By.XPATH, xp)
+                        if container:
+                            break
+                    except Exception:
+                        pass
+                if not container:
+                    time.sleep(0.2)
+                    continue
+                handle_wait_ms = min(timeout_ms, 4000)
+                handle = None
+                handle_candidates = [xpaths['slider_handle'], "//*[contains(@class,'slider-btn')]", "//*[contains(@class,'btn-icon')]"]
+                for hx in handle_candidates:
+                    try:
+                        handle = WebDriverWait(driver, handle_wait_ms / 1000.0, poll_frequency=poll_ms / 1000.0).until(EC.presence_of_element_located((By.XPATH, hx)))
+                        if handle:
+                            break
+                    except Exception:
+                        handle = None
+                try:
+                    width = driver.execute_script("return Math.floor(arguments[0].getBoundingClientRect().width)||arguments[0].offsetWidth||200;", container)
+                except Exception:
+                    width = container.size.get('width') or 200
+                handle_w = 24
+                try:
+                    if handle is not None:
+                        hw = handle.size.get('width')
+                        if hw:
+                            handle_w = hw
+                except Exception:
+                    pass
+                dist = 218 + offsets[i % len(offsets)]
+            except Exception:
+                dist = 120
+            try:
+                actions = ActionChains(driver)
+                if handle is not None:
+                    actions.move_to_element(handle).pause(0.05).move_by_offset(2, 0).click_and_hold(handle).pause(0.05)
+                else:
+                    h = container.size.get('height') or 20
+                    actions.move_to_element_with_offset(container, 5, int(h/2)).pause(0.05).click_and_hold().pause(0.05)
+                steps = max(6, int(dist / 24))
+                step_len = max(6, int(dist / steps))
+                moved = 0
+                for _ in range(steps):
+                    left = dist - moved
+                    dx = min(step_len, left)
+                    actions.move_by_offset(dx, 0).pause(0.01)
+                    moved += dx
+                actions.release().perform()
+                time.sleep(0.15)
+                try:
+                    print(f"slider attempt {i+1}/10 dist={dist}")
+                except Exception:
+                    pass
+                try:
+                    driver.switch_to.default_content()
+                except Exception:
+                    pass
+                disappeared = not element_exists(driver, xpaths['slider_container'], 2000, max(200, poll_ms))
+                if disappeared:
                     return True
-                # 若仍在 iframe 内，切回继续尝试
-                if element_exists(driver, xpaths['slider_iframe'], timeout_ms, poll_ms):
-                    iframe = driver.find_element(By.XPATH, xpaths['slider_iframe'])
-                    driver.switch_to.frame(iframe)
+                if ok_xpath and element_exists(driver, ok_xpath, min(5000, timeout_ms), poll_ms):
+                    return True
+                time.sleep(0.2)
             except Exception:
                 try:
                     driver.switch_to.default_content()
                 except Exception:
                     pass
-                time.sleep(0.1)
+                time.sleep(0.2)
     except Exception:
         try:
             driver.switch_to.default_content()
         except Exception:
             pass
-    return ok_xpath is None or element_exists(driver, ok_xpath, timeout_ms, poll_ms)
+    try:
+        driver.switch_to.default_content()
+    except Exception:
+        pass
+    if ok_xpath and element_exists(driver, ok_xpath, min(5000, timeout_ms), poll_ms):
+        return True
+    return False
 
 
 def extract_code_from_page_text(driver: webdriver.Remote) -> Optional[str]:
@@ -578,7 +654,7 @@ def perform_registration(
         if logger:
             logger("步骤: 打开平台网址")
         driver.get(platform_url)
-        if element_exists(driver, xpaths['language_menu'], timeout_ms, poll_ms):
+        if element_exists(driver, xpaths['language_menu'], min(timeout_ms, 8000), poll_ms):
             if logger:
                 logger("步骤: 打开语言菜单")
             find_click(driver, xpaths['language_menu'], timeout_ms, poll_ms)
@@ -594,7 +670,7 @@ def perform_registration(
             logger("步骤: 点击 More Tools")
         prev_handles = driver.window_handles
         find_click(driver, xpaths['More Tools'], timeout_ms, poll_ms)
-        WebDriverWait(driver, min(8, timeout_ms / 1000.0), poll_frequency=poll_ms / 1000.0).until(lambda d: len(d.window_handles) > len(prev_handles))
+        WebDriverWait(driver, min(5, timeout_ms / 1000.0), poll_frequency=poll_ms / 1000.0).until(lambda d: len(d.window_handles) > len(prev_handles))
         driver.switch_to.window(driver.window_handles[-1])
         if logger:
             logger("步骤: 已切换到新标签")
@@ -609,13 +685,13 @@ def perform_registration(
         find_click_any(driver, xpaths['Sign up for free'], timeout_ms, poll_ms)
         if logger:
             logger("步骤: 输入邮箱")
-        WebDriverWait(driver, timeout_ms / 1000.0).until(EC.presence_of_element_located((By.XPATH, xpaths['Enter Email Address']))).send_keys(email)
+        WebDriverWait(driver, min(timeout_ms, 10000) / 1000.0).until(EC.presence_of_element_located((By.XPATH, xpaths['Enter Email Address']))).send_keys(email)
         if logger:
             logger("步骤: 输入密码")
-        WebDriverWait(driver, timeout_ms / 1000.0).until(EC.presence_of_element_located((By.XPATH, xpaths['password_input']))).send_keys(password)
+        WebDriverWait(driver, min(timeout_ms, 10000) / 1000.0).until(EC.presence_of_element_located((By.XPATH, xpaths['password_input']))).send_keys(password)
         if logger:
             logger("步骤: 确认密码")
-        WebDriverWait(driver, timeout_ms / 1000.0).until(EC.presence_of_element_located((By.XPATH, xpaths['Confirm Password']))).send_keys(password)
+        WebDriverWait(driver, min(timeout_ms, 10000) / 1000.0).until(EC.presence_of_element_located((By.XPATH, xpaths['Confirm Password']))).send_keys(password)
         if logger:
             logger("步骤: 点击下一步")
         find_click_any(driver, xpaths['next_btn'], timeout_ms, poll_ms)
@@ -624,7 +700,14 @@ def perform_registration(
         if stop_event and stop_event.is_set():
             return False, 'stopped'
         if not solve_slider(driver, xpaths, timeout_ms, poll_ms):
-            return False, 'slider_failed'
+            try:
+                if element_exists(driver, xpaths['next_btn'], min(timeout_ms, 5000), poll_ms):
+                    find_click_any(driver, xpaths['next_btn'], timeout_ms, poll_ms)
+                time.sleep(2)
+            except Exception:
+                pass
+            if not solve_slider(driver, xpaths, timeout_ms, poll_ms):
+                return False, 'slider_failed'
         if logger:
             logger("步骤: 滑块通过")
         if logger:
@@ -636,13 +719,13 @@ def perform_registration(
             return False, 'code_not_found'
         if logger:
             logger("步骤: 获取验证码成功")
-        WebDriverWait(driver, timeout_ms / 1000.0).until(EC.presence_of_element_located((By.XPATH, xpaths['code_url_element']))).send_keys(code)
+        WebDriverWait(driver, min(timeout_ms, 10000) / 1000.0).until(EC.presence_of_element_located((By.XPATH, xpaths['code_url_element']))).send_keys(code)
         if logger:
             logger("步骤: 填写验证码")
         find_click_any(driver, xpaths['final_submit_btn'], timeout_ms, poll_ms)
         if logger:
             logger("步骤: 提交注册")
-        ok = element_exists(driver, xpaths['close_popup_svg'], timeout_ms, poll_ms)
+        ok = element_exists(driver, xpaths['close_popup_svg'], min(timeout_ms, 4000), poll_ms)
         if ok:
             try:
                 find_click(driver, xpaths['close_popup_svg'], timeout_ms, poll_ms)
@@ -692,6 +775,23 @@ def run_batch(
             payload = {'name': 'health-check', 'proxyMethod': 2, 'proxyType': 'noproxy', 'browserFingerPrint': {'coreVersion': '124'}}
             r = requests.post(f"{url.rstrip('/')}/browser/update", headers=client._headers(), data=json.dumps(payload), timeout=5)
             r.raise_for_status()
+            try:
+                data = r.json()
+                d = data.get('data')
+                bid = None
+                if isinstance(d, dict):
+                    bid = d.get('id')
+                elif isinstance(d, str):
+                    bid = d
+                if not bid:
+                    bid = data.get('id')
+                if bid:
+                    try:
+                        requests.post(f"{url.rstrip('/')}/browser/delete", headers=client._headers(), data=json.dumps({'id': bid}), timeout=5)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             return True
         except Exception:
             return False
