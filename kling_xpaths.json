@@ -1,5 +1,5 @@
-{"language_menu": "//*[text()='English']",
-  "english_option": "(//*[@class='el-dropdown-menu__item'])[1]",
+{"language_menu": "//*[contains(@class, 'language-switch')]",
+  "english_option": "//*[contains(@class, 'el-dropdown-menu__item') and contains(., 'English')]",
   "Creative Studio": "//*[text()='Creative Studio']",
   "More Tools": "//*[text()='More Tools']",
   "signin_btn": "//*[text()='Sign In']",

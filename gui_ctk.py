@@ -4,6 +4,8 @@ import threading
 import tkinter
 from tkinter import filedialog
 import customtkinter as ctk
+import subprocess
+import sys
 
 from register_kling_bitbrowser import run_batch, read_rows
 
@@ -16,6 +18,7 @@ class App(ctk.CTk):
         ctk.set_appearance_mode('dark')
         ctk.set_default_color_theme('blue')
         base_dir = os.path.dirname(__file__)
+        self.base_dir = base_dir
         self.csv_var = tkinter.StringVar(value=os.path.join(base_dir, 'kl-mail.csv'))
         self.xpath_var = tkinter.StringVar(value=os.path.join(base_dir, 'kling_xpaths.json'))
         self.bit_url_var = tkinter.StringVar(value='http://127.0.0.1:54345')
@@ -25,6 +28,7 @@ class App(ctk.CTk):
         self.timeout_ms_var = tkinter.IntVar(value=100000)
         self.poll_ms_var = tkinter.IntVar(value=500)
         self.max_rounds_var = tkinter.IntVar(value=5)
+        self.build_output_var = tkinter.StringVar(value=os.path.join(base_dir, 'dist'))
         self.enable_xpath_var = tkinter.BooleanVar(value=True)
         self.cnt_total_var = tkinter.StringVar(value='0')
         self.cnt_success_var = tkinter.StringVar(value='0')
@@ -85,6 +89,13 @@ class App(ctk.CTk):
         ctk.CTkButton(cfg, text='浏览', command=self.choose_xpath, width=80).grid(row=4, column=3, padx=6, pady=6, sticky='w')
         ctk.CTkLabel(cfg, text='最大轮数').grid(row=5, column=0, padx=6, pady=6, sticky='w')
         ctk.CTkEntry(cfg, textvariable=self.max_rounds_var, width=120).grid(row=5, column=1, padx=6, pady=6, sticky='w')
+        ctk.CTkLabel(cfg, text='打包输出目录').grid(row=6, column=0, padx=6, pady=6, sticky='w')
+        ctk.CTkEntry(cfg, textvariable=self.build_output_var, width=620).grid(row=6, column=1, padx=6, pady=6, sticky='w', columnspan=2)
+        ctk.CTkButton(cfg, text='选择目录', command=self.choose_build_output, width=80).grid(row=6, column=3, padx=6, pady=6, sticky='w')
+        ctk.CTkLabel(cfg, text='配置文件路径').grid(row=7, column=0, padx=6, pady=6, sticky='w')
+        self.config_path_var = tkinter.StringVar(value=os.path.join(self.base_dir, 'gui_config.json'))
+        ctk.CTkEntry(cfg, textvariable=self.config_path_var, width=620).grid(row=7, column=1, padx=6, pady=6, sticky='w', columnspan=2)
+        ctk.CTkButton(cfg, text='选择文件', command=self.choose_config_path, width=80).grid(row=7, column=3, padx=6, pady=6, sticky='w')
 
         ctk.CTkLabel(self, text='运行日志').pack(anchor='w', padx=12)
         self.log = ctk.CTkTextbox(self, height=220, width=920)
@@ -97,6 +108,7 @@ class App(ctk.CTk):
         ctk.CTkButton(btns, text='测试连接', command=self.test_connection).pack(side='left', padx=6)
         ctk.CTkButton(btns, text='保存参数', command=self.save_config).pack(side='left', padx=6)
         ctk.CTkButton(btns, text='恢复默认', command=self.reset_defaults).pack(side='left', padx=6)
+        ctk.CTkButton(btns, text='一键打包', command=self.build_package).pack(side='left', padx=6)
         ctk.CTkButton(btns, text='退出', command=self.destroy, fg_color='red').pack(side='right', padx=6)
 
     def choose_csv(self):
@@ -108,6 +120,16 @@ class App(ctk.CTk):
         p = filedialog.askopenfilename(filetypes=[('JSON','*.json'), ('All','*')])
         if p:
             self.xpath_var.set(p)
+
+    def choose_build_output(self):
+        p = filedialog.askdirectory()
+        if p:
+            self.build_output_var.set(p)
+
+    def choose_config_path(self):
+        p = filedialog.asksaveasfilename(defaultextension='.json', filetypes=[('JSON','*.json'), ('All','*')])
+        if p:
+            self.config_path_var.set(p)
 
     def load_csv_preview(self):
         try:
@@ -230,9 +252,10 @@ class App(ctk.CTk):
             'timeout_ms': int(self.timeout_ms_var.get()),
             'poll_ms': int(self.poll_ms_var.get()),
             'max_rounds': int(self.max_rounds_var.get()),
+            'build_output': self.build_output_var.get(),
         }
         try:
-            with open('gui_config.json', 'w', encoding='utf-8') as f:
+            with open(self.config_path_var.get(), 'w', encoding='utf-8') as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
             self.append_log('参数已保存')
         except Exception as e:
@@ -249,10 +272,11 @@ class App(ctk.CTk):
         self.timeout_ms_var.set(100000)
         self.poll_ms_var.set(500)
         self.max_rounds_var.set(5)
+        self.build_output_var.set(os.path.join(base_dir, 'dist'))
 
     def _load_config(self):
         try:
-            with open('gui_config.json', 'r', encoding='utf-8') as f:
+            with open(self.config_path_var.get(), 'r', encoding='utf-8') as f:
                 cfg = json.load(f)
             self.csv_var.set(cfg.get('csv', self.csv_var.get()))
             self.xpath_var.set(cfg.get('xpaths', self.xpath_var.get()))
@@ -263,6 +287,7 @@ class App(ctk.CTk):
             self.timeout_ms_var.set(int(cfg.get('timeout_ms', self.timeout_ms_var.get())))
             self.poll_ms_var.set(int(cfg.get('poll_ms', self.poll_ms_var.get())))
             self.max_rounds_var.set(int(cfg.get('max_rounds', self.max_rounds_var.get())))
+            self.build_output_var.set(cfg.get('build_output', self.build_output_var.get()))
             self.concurrent_sel_var.set(str(self.concurrent_var.get()))
             self.poll_sel_var.set(str(self.poll_ms_var.get()))
             self.append_log('已加载上次保存的参数')
@@ -272,6 +297,38 @@ class App(ctk.CTk):
                 pass
         except Exception:
             pass
+
+    def build_package(self):
+        try:
+            base_dir = os.path.dirname(__file__)
+            env = os.environ.copy()
+            env['BUILD_OUT'] = self.build_output_var.get()
+            if sys.platform.startswith('win'):
+                script = os.path.join(base_dir, 'run_build_windows.bat')
+                if not os.path.exists(script):
+                    self.append_log('未找到打包脚本: run_build_windows.bat')
+                    return
+                def run():
+                    try:
+                        subprocess.run([script], cwd=base_dir, env=env, check=True)
+                        self.append_log('打包完成')
+                    except Exception as e:
+                        self.append_log(str(e))
+                threading.Thread(target=run, daemon=True).start()
+            else:
+                script = os.path.join(base_dir, 'run_build_mac.sh')
+                if not os.path.exists(script):
+                    self.append_log('未找到打包脚本: run_build_mac.sh')
+                    return
+                def run():
+                    try:
+                        subprocess.run(['bash', script], cwd=base_dir, env=env, check=True)
+                        self.append_log('打包完成')
+                    except Exception as e:
+                        self.append_log(str(e))
+                threading.Thread(target=run, daemon=True).start()
+        except Exception as e:
+            self.append_log(str(e))
 
 
 if __name__ == '__main__':
