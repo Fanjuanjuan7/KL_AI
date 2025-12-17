@@ -412,85 +412,107 @@ def extract_verification_code_flow(driver: webdriver.Remote, code_url: str, code
         if logger:
             logger("等待接码邮件到达 5 秒")
         time.sleep(5)
-        # 优先使用 DevTools 在当前窗口创建新标签
-        created = False
-        prev_len = len(driver.window_handles)
-        if debugger_http:
-            try:
-                base = debugger_http if debugger_http.startswith('http') else f"http://{debugger_http}"
-                encoded = urllib.parse.quote(code_url, safe='')
-                if logger:
-                    logger(f"调试接口创建标签: {base}/json/new?{encoded}")
-                r = requests.get(f"{base}/json/new?{encoded}", timeout=8)
-                created = r.status_code == 200
-            except Exception as e:
-                if logger:
-                    logger(f"调试接口创建失败: {e}")
-        if created:
-            try:
-                WebDriverWait(driver, 10).until(lambda d: len(d.window_handles) > prev_len)
-                driver.switch_to.window(driver.window_handles[-1])
-                if logger:
-                    try:
-                        logger(f"已切换到新标签: {driver.current_url}")
-                    except Exception:
-                        logger("已切换到新标签")
-            except Exception:
-                created = False
-        if not created:
-            # 回退到 Selenium 新建标签
-            driver.switch_to.new_window('tab')
-            if logger:
-                logger(f"打开接码链接: {code_url}")
-            try:
-                driver.get(code_url)
-            except Exception as nav_err:
-                if logger:
-                    logger(f"导航失败: {nav_err}")
-        try:
-            WebDriverWait(driver, 20).until(lambda d: d.execute_script("return document.readyState") in ("interactive", "complete"))
-            if logger:
-                logger("接码页已加载")
-        except Exception:
-            if logger:
-                logger("接码页加载超时")
-            time.sleep(2)
-        code: Optional[str] = None
-        for attempt in range(3):
-            if logger:
-                logger(f"尝试提取验证码 {attempt+1}/3")
-            try:
-                if code_xpath:
-                    el = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.XPATH, code_xpath)))
-                    txt = (el.text or el.get_attribute('value') or '').strip()
-                    if logger:
-                        logger(f"元素文本: '{txt}'")
-                    m = re.search(r"\b(\d{6})\b", txt)
-                    if m:
-                        code = m.group(1)
-                        break
-                    clean = txt.replace(' ', '').replace('\n', '')
-                    if clean.isdigit() and len(clean) == 6:
-                        code = clean
-                        break
-            except Exception as e:
-                if logger:
-                    logger(f"元素提取失败: {e}")
-            if not code:
+        for open_try in range(3):
+            created = False
+            prev_len = len(driver.window_handles)
+            if debugger_http:
                 try:
-                    body_txt = driver.find_element(By.TAG_NAME, 'body').text
-                    m2 = re.search(r"\b(\d{6})\b", body_txt)
-                    if m2:
-                        code = m2.group(1)
-                        if logger:
-                            logger(f"页面文本提取验证码: {code}")
-                        break
+                    base = debugger_http if debugger_http.startswith('http') else f"http://{debugger_http}"
+                    encoded = urllib.parse.quote(code_url, safe='')
+                    if logger:
+                        logger(f"调试接口创建标签: {base}/json/new?{encoded}")
+                    r = requests.get(f"{base}/json/new?{encoded}", timeout=8)
+                    created = r.status_code == 200
+                except Exception as e:
+                    if logger:
+                        logger(f"调试接口创建失败: {e}")
+            if created:
+                try:
+                    WebDriverWait(driver, 10).until(lambda d: len(d.window_handles) > prev_len)
+                    driver.switch_to.window(driver.window_handles[-1])
+                    if logger:
+                        try:
+                            logger(f"已切换到新标签: {driver.current_url}")
+                        except Exception:
+                            logger("已切换到新标签")
+                except Exception:
+                    created = False
+            if not created:
+                driver.switch_to.new_window('tab')
+                if logger:
+                    logger(f"打开接码链接: {code_url}")
+                try:
+                    driver.get(code_url)
+                except Exception as nav_err:
+                    if logger:
+                        logger(f"导航失败: {nav_err}")
+                    try:
+                        driver.execute_script("window.location.href=arguments[0];", code_url)
+                    except Exception:
+                        pass
+            loaded = False
+            try:
+                WebDriverWait(driver, 15).until(lambda d: d.execute_script("return document.readyState") in ("interactive", "complete"))
+                loaded = True
+                if logger:
+                    logger("接码页已加载")
+            except Exception:
+                if logger:
+                    logger("接码页加载超时")
+            if loaded:
+                break
+            try:
+                driver.close()
+                driver.switch_to.window(main_handle)
+            except Exception:
+                pass
+            time.sleep(1)
+        code: Optional[str] = None
+        for rtry in range(3):
+            if logger:
+                logger(f"验证码抓取窗口刷新尝试 {rtry+1}/3")
+            start = time.time()
+            while (time.time() - start) < 5 and not code:
+                try:
+                    if code_xpath:
+                        try:
+                            el = WebDriverWait(driver, 3).until(EC.presence_of_element_located((By.XPATH, code_xpath)))
+                            txt = (el.text or el.get_attribute('value') or '').strip()
+                            if logger:
+                                logger(f"元素文本: '{txt}'")
+                            m = re.search(r"\b(\d{6})\b", txt)
+                            if m:
+                                code = m.group(1)
+                                break
+                            clean = txt.replace(' ', '').replace('\n', '')
+                            if clean.isdigit() and len(clean) == 6:
+                                code = clean
+                                break
+                        except Exception:
+                            pass
+                    if not code:
+                        try:
+                            body_txt = driver.find_element(By.TAG_NAME, 'body').text
+                            m2 = re.search(r"\b(\d{6})\b", body_txt)
+                            if m2:
+                                code = m2.group(1)
+                                if logger:
+                                    logger(f"页面文本提取验证码: {code}")
+                                break
+                        except Exception:
+                            pass
                 except Exception:
                     pass
-            if not code and attempt < 2:
+                time.sleep(1)
+            if code:
+                break
+            try:
+                driver.refresh()
                 if logger:
-                    logger("等待 2 秒后重试")
-                time.sleep(2)
+                    logger("已刷新接码页面")
+                WebDriverWait(driver, 10).until(lambda d: d.execute_script("return document.readyState") in ("interactive", "complete"))
+            except Exception:
+                time.sleep(1)
         driver.close()
         driver.switch_to.window(main_handle)
         return code
