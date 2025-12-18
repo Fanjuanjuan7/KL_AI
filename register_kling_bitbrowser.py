@@ -148,7 +148,7 @@ def write_rows_csv(input_path: str, rows: List[Dict[str, Any]]) -> None:
 
 def element_exists(driver: webdriver.Remote, xpath: str, timeout_ms: int, poll_ms: int) -> bool:
     try:
-        eff_timeout = min(timeout_ms, 12000)
+        eff_timeout = min(timeout_ms, 30000)
         eff_poll = max(0.2, poll_ms / 1000.0)
         WebDriverWait(driver, eff_timeout / 1000.0, poll_frequency=eff_poll).until(EC.presence_of_element_located((By.XPATH, xpath)))
         return True
@@ -409,9 +409,9 @@ def extract_code_attempts(driver: webdriver.Remote, xpath: Optional[str], logger
 def extract_verification_code_flow(driver: webdriver.Remote, code_url: str, code_xpath: Optional[str], logger: Optional[Any], debugger_http: Optional[str] = None) -> Optional[str]:
     main_handle = driver.current_window_handle
     try:
-        if logger:
-            logger("等待接码邮件到达 5 秒")
-        time.sleep(5)
+        # if logger:
+        #     logger("等待接码邮件到达 5 秒")
+        # time.sleep(5)
         for open_try in range(3):
             created = False
             prev_len = len(driver.window_handles)
@@ -759,12 +759,25 @@ def perform_registration(
         find_click_any(driver, xpaths['final_submit_btn'], timeout_ms, poll_ms)
         if logger:
             logger("步骤: 提交注册")
-        ok = element_exists(driver, xpaths['close_popup_svg'], min(timeout_ms, 4000), poll_ms)
-        if ok:
+        # Ensure we find the close popup
+        # Retry finding the element in case of stale element or transient error
+        popup_found = False
+        for _ in range(3):
+            if element_exists(driver, xpaths['close_popup_svg'], 30000, poll_ms):
+                popup_found = True
+                break
+            time.sleep(1)
+
+        if popup_found:
             try:
                 find_click(driver, xpaths['close_popup_svg'], timeout_ms, poll_ms)
+                time.sleep(3)
             except Exception:
                 pass
+        else:
+            if logger:
+                logger("步骤: 未找到关闭弹窗按钮")
+            return False, 'popup_not_found'
         result_ok = True
         return True, '成功'
     except Exception as e:

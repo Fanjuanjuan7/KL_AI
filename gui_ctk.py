@@ -17,10 +17,22 @@ class App(ctk.CTk):
         self.geometry('1100x800')
         ctk.set_appearance_mode('dark')
         ctk.set_default_color_theme('blue')
-        base_dir = os.path.dirname(__file__)
-        self.base_dir = base_dir
-        self.csv_var = tkinter.StringVar(value=os.path.join(base_dir, 'kl-mail.csv'))
-        self.xpath_var = tkinter.StringVar(value=os.path.join(base_dir, 'kling_xpaths.json'))
+        if getattr(sys, 'frozen', False):
+            self.base_dir = os.path.dirname(__file__)
+            self.exe_dir = os.path.dirname(sys.executable)
+        else:
+            self.base_dir = os.path.dirname(__file__)
+            self.exe_dir = self.base_dir
+
+        # Use exe_dir for config/user files, base_dir for bundled resources
+        self.csv_var = tkinter.StringVar(value=os.path.join(self.exe_dir, 'kl-mail.csv'))
+        if not os.path.exists(self.csv_var.get()):
+             self.csv_var.set(os.path.join(self.base_dir, 'kl-mail.csv'))
+
+        self.xpath_var = tkinter.StringVar(value=os.path.join(self.exe_dir, 'kling_xpaths.json'))
+        if not os.path.exists(self.xpath_var.get()):
+             self.xpath_var.set(os.path.join(self.base_dir, 'kling_xpaths.json'))
+
         self.bit_url_var = tkinter.StringVar(value='http://127.0.0.1:54345')
         self.bit_secret_var = tkinter.StringVar(value=os.environ.get('BITBROWSER_SECRET') or '')
         self.platform_url_var = tkinter.StringVar(value='https://klingai.com/global')
@@ -28,7 +40,7 @@ class App(ctk.CTk):
         self.timeout_ms_var = tkinter.IntVar(value=100000)
         self.poll_ms_var = tkinter.IntVar(value=500)
         self.max_rounds_var = tkinter.IntVar(value=5)
-        self.build_output_var = tkinter.StringVar(value=os.path.join(base_dir, 'dist'))
+        self.build_output_var = tkinter.StringVar(value=os.path.join(self.exe_dir, 'dist'))
         self.enable_xpath_var = tkinter.BooleanVar(value=True)
         self.cnt_total_var = tkinter.StringVar(value='0')
         self.cnt_success_var = tkinter.StringVar(value='0')
@@ -93,7 +105,7 @@ class App(ctk.CTk):
         ctk.CTkEntry(cfg, textvariable=self.build_output_var, width=620).grid(row=6, column=1, padx=6, pady=6, sticky='w', columnspan=2)
         ctk.CTkButton(cfg, text='选择目录', command=self.choose_build_output, width=80).grid(row=6, column=3, padx=6, pady=6, sticky='w')
         ctk.CTkLabel(cfg, text='配置文件路径').grid(row=7, column=0, padx=6, pady=6, sticky='w')
-        self.config_path_var = tkinter.StringVar(value=os.path.join(self.base_dir, 'gui_config.json'))
+        self.config_path_var = tkinter.StringVar(value=os.path.join(self.exe_dir, 'gui_config.json'))
         ctk.CTkEntry(cfg, textvariable=self.config_path_var, width=620).grid(row=7, column=1, padx=6, pady=6, sticky='w', columnspan=2)
         ctk.CTkButton(cfg, text='选择文件', command=self.choose_config_path, width=80).grid(row=7, column=3, padx=6, pady=6, sticky='w')
 
@@ -262,9 +274,16 @@ class App(ctk.CTk):
             self.append_log(str(e))
 
     def reset_defaults(self):
-        base_dir = os.path.dirname(__file__)
-        self.csv_var.set(os.path.join(base_dir, 'kl-mail.csv'))
-        self.xpath_var.set(os.path.join(base_dir, 'kling_xpaths.json'))
+        csv_path = os.path.join(self.exe_dir, 'kl-mail.csv')
+        if not os.path.exists(csv_path):
+            csv_path = os.path.join(self.base_dir, 'kl-mail.csv')
+        self.csv_var.set(csv_path)
+
+        xpath_path = os.path.join(self.exe_dir, 'kling_xpaths.json')
+        if not os.path.exists(xpath_path):
+            xpath_path = os.path.join(self.base_dir, 'kling_xpaths.json')
+        self.xpath_var.set(xpath_path)
+
         self.bit_url_var.set('http://127.0.0.1:54345')
         self.bit_secret_var.set(os.environ.get('BITBROWSER_SECRET') or '')
         self.platform_url_var.set('https://klingai.com/global')
@@ -272,7 +291,7 @@ class App(ctk.CTk):
         self.timeout_ms_var.set(100000)
         self.poll_ms_var.set(500)
         self.max_rounds_var.set(5)
-        self.build_output_var.set(os.path.join(base_dir, 'dist'))
+        self.build_output_var.set(os.path.join(self.exe_dir, 'dist'))
 
     def _load_config(self):
         try:
