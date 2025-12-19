@@ -462,8 +462,7 @@ def extract_verification_code_flow(driver: webdriver.Remote, code_url: str, code
             if loaded:
                 break
             try:
-                driver.close()
-                driver.switch_to.window(main_handle)
+                driver.refresh()
             except Exception:
                 pass
             time.sleep(1)
@@ -579,13 +578,13 @@ def open_attached_driver(open_data: Dict[str, Any]) -> webdriver.Chrome:
     options = webdriver.ChromeOptions()
     options.debugger_address = debugger_address
     try:
-        options.page_load_strategy = 'eager'
+        options.page_load_strategy = 'none'
     except Exception:
         pass
     service = Service(executable_path=driver_path)
     driver = webdriver.Chrome(service=service, options=options)
     try:
-        driver.set_page_load_timeout(60)
+        driver.set_page_load_timeout(25)
     except Exception:
         pass
     return driver
@@ -687,7 +686,43 @@ def perform_registration(
     try:
         if logger:
             logger("步骤: 打开平台网址")
-        driver.get(platform_url)
+        try:
+            driver.get(platform_url)
+        except Exception:
+            try:
+                driver.execute_script("window.location.href=arguments[0];", platform_url)
+            except Exception:
+                pass
+        ready = False
+        for xp_key in ('language_menu', 'signin_btn', 'Creative Studio'):
+            try:
+                xp_val = xpaths.get(xp_key)
+                if xp_val and element_exists(driver, xp_val, 8000, poll_ms):
+                    ready = True
+                    break
+            except Exception:
+                pass
+        if not ready:
+            try:
+                driver.refresh()
+            except Exception:
+                pass
+            for xp_key in ('language_menu', 'signin_btn', 'Creative Studio'):
+                try:
+                    xp_val = xpaths.get(xp_key)
+                    if xp_val and element_exists(driver, xp_val, 8000, poll_ms):
+                        ready = True
+                        break
+                except Exception:
+                    pass
+        if not ready and open_data.get('http'):
+            prev_handles = driver.window_handles
+            open_tab_via_debugger(open_data.get('http') or '', platform_url, logger)
+            try:
+                WebDriverWait(driver, 8).until(lambda d: len(d.window_handles) > len(prev_handles))
+                driver.switch_to.window(driver.window_handles[-1])
+            except Exception:
+                pass
         if element_exists(driver, xpaths['language_menu'], min(timeout_ms, 8000), poll_ms):
             if logger:
                 logger("步骤: 打开语言菜单")

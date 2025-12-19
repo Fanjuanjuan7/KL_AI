@@ -4,7 +4,7 @@
   "bit_url": "http://127.0.0.1:54345",
   "bit_secret": "",
   "platform_url": "https://klingai.com/global",
-  "concurrency": 3,
+  "concurrency": 2,
   "timeout_ms": 100000,
   "poll_ms": 500,
   "max_rounds": 2,
