@@ -148,7 +148,7 @@ def write_rows_csv(input_path: str, rows: List[Dict[str, Any]]) -> None:
 
 def element_exists(driver: webdriver.Remote, xpath: str, timeout_ms: int, poll_ms: int) -> bool:
     try:
-        eff_timeout = min(timeout_ms, 30000)
+        eff_timeout = min(timeout_ms, 60000)
         eff_poll = max(0.2, poll_ms / 1000.0)
         WebDriverWait(driver, eff_timeout / 1000.0, poll_frequency=eff_poll).until(EC.presence_of_element_located((By.XPATH, xpath)))
         return True
@@ -156,18 +156,28 @@ def element_exists(driver: webdriver.Remote, xpath: str, timeout_ms: int, poll_m
         return False
 
 
+def element_visible(driver: webdriver.Remote, xpath: str, timeout_ms: int, poll_ms: int) -> bool:
+    try:
+        eff_timeout = min(timeout_ms, 60000)
+        eff_poll = max(0.2, poll_ms / 1000.0)
+        WebDriverWait(driver, eff_timeout / 1000.0, poll_frequency=eff_poll).until(EC.visibility_of_element_located((By.XPATH, xpath)))
+        return True
+    except Exception:
+        return False
+
+
 def find_click(driver: webdriver.Remote, xpath: str, timeout_ms: int, poll_ms: int) -> None:
-    eff_timeout = min(timeout_ms, 10000)
+    eff_timeout = min(timeout_ms, 60000)
     WebDriverWait(driver, eff_timeout / 1000.0, poll_frequency=poll_ms / 1000.0).until(EC.element_to_be_clickable((By.XPATH, xpath))).click()
 
 
 def find_click_any(driver: webdriver.Remote, xpath: str, timeout_ms: int, poll_ms: int) -> None:
     try:
-        eff_timeout = min(timeout_ms, 10000)
+        eff_timeout = min(timeout_ms, 60000)
         WebDriverWait(driver, eff_timeout / 1000.0, poll_frequency=poll_ms / 1000.0).until(EC.element_to_be_clickable((By.XPATH, xpath))).click()
         return
     except Exception:
-        eff_timeout = min(timeout_ms, 10000)
+        eff_timeout = min(timeout_ms, 60000)
         el = WebDriverWait(driver, eff_timeout / 1000.0, poll_frequency=poll_ms / 1000.0).until(EC.presence_of_element_located((By.XPATH, xpath)))
         driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
         try:
@@ -199,12 +209,14 @@ def _human_drag_track(distance: int, duration_ms: int = 900, jitter_px: int = 1,
 
 def solve_slider(driver: webdriver.Remote, xpaths: Dict[str, str], timeout_ms: int, poll_ms: int) -> bool:
     # 等待滑块弹窗出现（容器或 iframe 任一）
-    appear_wait_ms = min(timeout_ms, 25000)
+    # 用户要求增大等待时间，确保检测到滑块
+    appear_wait_ms = max(timeout_ms, 60000)
     start = time.time()
     while (time.time() - start) * 1000 < appear_wait_ms:
-        if element_exists(driver, xpaths['slider_iframe'], 800, poll_ms) or element_exists(driver, xpaths['slider_container'], 800, poll_ms):
+        # 使用 element_visible 替代 element_exists 确保元素可见
+        if element_visible(driver, xpaths['slider_iframe'], 800, poll_ms) or element_visible(driver, xpaths['slider_container'], 800, poll_ms):
             break
-        time.sleep(max(0.1, poll_ms/1000.0))
+        time.sleep(max(0.2, poll_ms/1000.0))
     else:
         # 长时间未出现滑块，不视为成功，返回 False 以便上层处理
         return False
@@ -237,11 +249,17 @@ def solve_slider(driver: webdriver.Remote, xpaths: Dict[str, str], timeout_ms: i
                     except Exception:
                         pass
                 if not container:
-                    time.sleep(0.2)
+                    time.sleep(1.5)  # 找不到容器时增加等待
                     continue
                 handle_wait_ms = min(timeout_ms, 4000)
                 handle = None
                 handle_candidates = [xpaths['slider_handle'], "//*[contains(@class,'slider-btn')]", "//*[contains(@class,'btn-icon')]"]
+                # 显式等待滑块句柄出现
+                try:
+                    WebDriverWait(driver, 5).until(lambda d: any(element_exists(d, hx, 500, poll_ms) for hx in handle_candidates))
+                except Exception:
+                    pass
+
                 for hx in handle_candidates:
                     try:
                         handle = WebDriverWait(driver, handle_wait_ms / 1000.0, poll_frequency=poll_ms / 1000.0).until(EC.presence_of_element_located((By.XPATH, hx)))
@@ -267,17 +285,17 @@ def solve_slider(driver: webdriver.Remote, xpaths: Dict[str, str], timeout_ms: i
             try:
                 actions = ActionChains(driver)
                 if handle is not None:
-                    actions.move_to_element(handle).pause(0.05).move_by_offset(2, 0).click_and_hold(handle).pause(0.05)
+                    actions.move_to_element(handle).pause(0.2).move_by_offset(2, 0).click_and_hold(handle).pause(0.2)
                 else:
                     h = container.size.get('height') or 20
-                    actions.move_to_element_with_offset(container, 5, int(h/2)).pause(0.05).click_and_hold().pause(0.05)
-                steps = max(6, int(dist / 24))
-                step_len = max(6, int(dist / steps))
+                    actions.move_to_element_with_offset(container, 5, int(h/2)).pause(0.2).click_and_hold().pause(0.2)
+                steps = max(10, int(dist / 15))
+                step_len = max(5, int(dist / steps))
                 moved = 0
                 for _ in range(steps):
                     left = dist - moved
                     dx = min(step_len, left)
-                    actions.move_by_offset(dx, 0).pause(0.01)
+                    actions.move_by_offset(dx, 0).pause(0.02)
                     moved += dx
                 actions.release().perform()
                 time.sleep(0.15)
@@ -609,11 +627,18 @@ def open_tab_via_debugger(debugger_address: str, url: str, logger: Optional[Any]
         return False
 
 
-def proxy_payload(host: str, port: str, username: Optional[str], password: Optional[str]) -> Dict[str, Any]:
+def proxy_payload(host: str, port: str, username: Optional[str], password: Optional[str], protocol: str = 'socks5') -> Dict[str, Any]:
     if not host or not port:
         return {'proxyType': 'noproxy'}
+    
+    # Map protocol to bitbrowser proxyType if needed
+    # Common types: socks5, http, https
+    ptype = protocol.lower() if protocol else 'socks5'
+    if ptype not in ('socks5', 'http', 'https', 'ssh'):
+        ptype = 'socks5'
+
     p: Dict[str, Any] = {
-        'proxyType': 'socks5',
+        'proxyType': ptype,
         'host': host,
         'port': str(port),
         'proxyHost': host,
@@ -623,10 +648,12 @@ def proxy_payload(host: str, port: str, username: Optional[str], password: Optio
         p['proxyUserName'] = username
     if password:
         p['proxyPassword'] = password
+    
+    # Construct proxy string URL
     if username and password:
-        p['proxy'] = f"socks5://{username}:{password}@{host}:{port}"
+        p['proxy'] = f"{ptype}://{username}:{password}@{host}:{port}"
     else:
-        p['proxy'] = f"socks5://{host}:{port}"
+        p['proxy'] = f"{ptype}://{host}:{port}"
     return p
 
 
@@ -663,17 +690,25 @@ def perform_registration(
     host = str(row.get('host') or row.get('代理IP') or '').strip()
     port = str(row.get('port') or row.get('端口') or '').strip()
     proxy_username = str(row.get('proxyUserName') or row.get('用户名') or '').strip()
-    proxy_password = str(row.get('proxyproxyPasswordPassword') or row.get('proxyPassword') or row.get('密码2') or '').strip()
+    proxy_password = str(row.get('proxyPassword') or row.get('密码2') or '').strip()
+    protocol = str(row.get('protocol') or row.get('proxyType') or 'socks5').strip()
     window_name = str(row.get('windowName') or row.get('窗口名称') or email or 'win').strip()
     if stop_event and stop_event.is_set():
         return False, 'stopped'
     if logger:
         logger(f"create_profile {window_name}")
     browser_id = None
+    driver = None
     try:
-        browser_id = client.update_browser(window_name, proxy_payload(host, port, proxy_username, proxy_password))
+        browser_id = client.update_browser(window_name, proxy_payload(host, port, proxy_username, proxy_password, protocol))
     except Exception:
-        browser_id = client.update_browser(window_name, proxy_payload(host, port, proxy_username, proxy_password))
+        # 如果更新失败（如不存在），尝试创建
+        try:
+            browser_id = client.create_browser(window_name, proxy_payload(host, port, proxy_username, proxy_password, protocol))
+        except Exception as create_err:
+            if logger:
+                logger(f"创建窗口失败: {create_err}")
+            return False, f"create_browser failed: {create_err}"
     if logger:
         logger(f"profile_id {browser_id}")
     open_data = client.open_browser(browser_id)
@@ -740,9 +775,19 @@ def perform_registration(
         prev_handles = driver.window_handles
         find_click(driver, xpaths['More Tools'], timeout_ms, poll_ms)
         WebDriverWait(driver, min(5, timeout_ms / 1000.0), poll_frequency=poll_ms / 1000.0).until(lambda d: len(d.window_handles) > len(prev_handles))
-        driver.switch_to.window(driver.window_handles[-1])
+        # Ensure new handle is valid before switch
+        time.sleep(1.5)
+        new_handles = driver.window_handles
+        target_handle = [h for h in new_handles if h not in prev_handles][-1]
+        driver.switch_to.window(target_handle)
         if logger:
             logger("步骤: 已切换到新标签")
+        # Wait for page readiness in new tab to avoid crash
+        try:
+            WebDriverWait(driver, 10).until(lambda d: d.execute_script("return document.readyState") == "complete")
+        except Exception:
+            pass
+        time.sleep(0.5)
         if logger:
             logger("步骤: 点击 Sign In")
         find_click_any(driver, xpaths['signin_btn'], timeout_ms, poll_ms)
@@ -819,18 +864,29 @@ def perform_registration(
         return False, str(e)
     finally:
         try:
-            driver.quit()
+            if driver:
+                driver.quit()
         except Exception:
             pass
         try:
-            client.close_browser(browser_id)
+            if browser_id:
+                client.close_browser(browser_id)
         except Exception:
             pass
-        if not result_ok:
-            try:
-                client.delete_browser(browser_id)
-            except Exception:
-                pass
+        
+        # 给予比特浏览器一点时间来完全释放资源
+        if browser_id and not result_ok:
+            time.sleep(2)
+            for _ in range(3):
+                try:
+                    client.delete_browser(browser_id)
+                    if logger:
+                        logger(f"已删除失败窗口: {browser_id}")
+                    break
+                except Exception as del_err:
+                    if logger:
+                        logger(f"删除窗口失败(重试): {del_err}")
+                    time.sleep(1.5)
 
 
 def run_batch(
@@ -846,6 +902,10 @@ def run_batch(
     logger: Optional[Any] = None,
     stop_event: Optional[threading.Event] = None,
     progress_cb: Optional[Any] = None,
+    ip_manager: Optional[Any] = None,
+    exhaustion_cb: Optional[Any] = None,
+    target_success_count: int = 99999999,
+    email_manager: Optional[Any] = None,
 ) -> None:
     rows = read_rows(input_path)
     if not rows:
@@ -890,14 +950,78 @@ def run_batch(
             if logger:
                 logger("比特浏览器接口不可用，请确认应用已启动并开启本地API")
             return
+    
     lock = threading.Lock()
-
+    global_success_count = 0
+    
     def task(idx: int, r: Dict[str, Any]) -> Tuple[int, bool, str]:
+        nonlocal global_success_count
         if stop_event and stop_event.is_set():
             return idx, False, 'stopped'
-        ok, msg = perform_registration(r, xpaths, platform_url, timeout_ms, poll_ms, client, logger, stop_event)
+            
         with lock:
-            r['status'] = 'good' if ok else 'fail'
+            if global_success_count >= target_success_count:
+                return idx, False, 'target_reached'
+        
+        email = str(r.get('email') or r.get('账号') or '').strip()
+        
+        # IP Allocation Logic
+        if ip_manager:
+            while True:
+                if stop_event and stop_event.is_set():
+                    return idx, False, 'stopped'
+                with lock:
+                    if global_success_count >= target_success_count:
+                        return idx, False, 'target_reached'
+                
+                ip_entry, status = ip_manager.allocate_ip(email)
+                if status == 'success' and ip_entry:
+                    # Inject IP into row
+                    r['host'] = ip_entry['host']
+                    r['port'] = ip_entry['port']
+                    r['proxyUserName'] = ip_entry.get('proxyUserName', '')
+                    r['proxyPassword'] = ip_entry.get('proxyPassword', '')
+                    r['protocol'] = ip_entry.get('protocol', 'socks5')
+                    if logger:
+                        logger(f"已分配IP: {r['host']}:{r['port']} ({r['protocol']}) 给 {email}")
+                    break
+                elif status == 'email_used':
+                    if logger:
+                        logger(f"跳过 {email}: 此邮箱已在IP池中使用过")
+                    return idx, False, 'email_already_used_in_pool'
+                elif status == 'ip_exhausted':
+                    if exhaustion_cb:
+                        if logger:
+                            logger("IP池耗尽，等待用户处理...")
+                        action = exhaustion_cb('ip_exhausted', ip_manager.get_stats())
+                        if action == 'retry':
+                            if logger:
+                                logger("用户选择重试分配IP")
+                            continue
+                        else:
+                            if logger:
+                                logger("用户取消任务")
+                            return idx, False, 'ip_exhausted_cancelled'
+                    else:
+                        return idx, False, 'ip_exhausted_no_handler'
+                else:
+                    return idx, False, f'ip_allocation_error: {status}'
+
+        ok, msg = perform_registration(r, xpaths, platform_url, timeout_ms, poll_ms, client, logger, stop_event)
+        
+        if ip_manager and not ok:
+            # Release IP on failure
+             ip_manager.release_ip(r.get('host'), r.get('port'), email)
+             if logger:
+                 logger(f"注册失败，已释放IP资源: {email}")
+                 
+        with lock:
+            if ok:
+                r['status'] = 'good'
+                global_success_count += 1
+            else:
+                r['status'] = 'fail'
+                
         return idx, ok, msg
 
     pending_idx = [i for i, r in enumerate(rows) if str(r.get('status', '')).strip() != 'good']
@@ -905,26 +1029,71 @@ def run_batch(
     while pending_idx and rounds < max_rounds:
         if stop_event and stop_event.is_set():
             break
+        
+        # Check target count before round
+        with lock:
+            if global_success_count >= target_success_count:
+                if logger: logger("已达到目标注册数量")
+                break
+            remaining_needed = target_success_count - global_success_count
+
+        # Cap concurrency by remaining needed
+        current_concurrency = max(1, min(concurrency, remaining_needed))
+        
         futures = []
-        with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
+        with ThreadPoolExecutor(max_workers=current_concurrency) as ex:
+            # Only submit up to current_concurrency tasks from pending_idx
+            # But wait, pending_idx can be large. 
+            # If we submit all pending_idx, ThreadPoolExecutor will queue them.
+            # We should only submit what we need + maybe a buffer?
+            # Or just rely on max_workers to limit concurrent executions.
+            # But if we submit 1000 tasks, they are queued.
+            # Better to submit in batches or rely on the fact that task() checks the lock.
+            # But if we want to "Prioritize current registration request", limiting max_workers is key.
+            # Also, we should probably not submit ALL pending_idx if we only need 1 more.
+            
+            submit_count = 0
             for i in pending_idx:
+                if stop_event and stop_event.is_set():
+                    break
+                # Double check if we have enough futures running/queued?
+                # ThreadPoolExecutor manages this.
                 futures.append(ex.submit(task, i, rows[i]))
+                submit_count += 1
+                # Optimization: If we have submitted enough to potentially cover the target, maybe stop submitting?
+                # But some might fail. So we usually submit more.
+                # But limiting max_workers is the most direct way to control "concurrency".
+                
             for fut in as_completed(futures):
                 try:
                     i, ok, msg = fut.result()
                     if logger:
                         logger(f"row {i} {'ok' if ok else 'fail'} {msg}")
+                    
                     if progress_cb:
                         total = len(rows)
                         succ = sum(1 for rr in rows if str(rr.get('status', '')).strip() == 'good')
                         fail = sum(1 for rr in rows if str(rr.get('status', '')).strip() == 'fail')
-                        progress_cb({'total': total, 'success': succ, 'fail': fail})
+                        if callable(progress_cb):
+                             progress_cb(total, succ, fail)
+                             
+                    # Check target count during execution
+                    with lock:
+                         if global_success_count >= target_success_count:
+                             if not stop_event.is_set(): # Signal others to stop gracefully? 
+                                 # We can't cancel running futures easily, but stop_event helps.
+                                 # But we shouldn't set stop_event globally if it affects other things?
+                                 # Here stop_event is passed from GUI.
+                                 # If we set it, it stops everything. That's fine.
+                                 stop_event.set()
+                                 if logger: logger("已达到目标注册数量，正在停止剩余任务...")
+                                 
                 except Exception:
                     pass
         write_rows_csv(input_path, rows)
         pending_idx = [i for i, r in enumerate(rows) if str(r.get('status', '')).strip() != 'good']
         rounds += 1
-        if pending_idx:
+        if pending_idx and not stop_event.is_set():
             time.sleep(3)
 
 

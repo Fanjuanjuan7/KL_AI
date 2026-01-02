@@ -1,0 +1,6 @@
+{
+  "max_usage_per_ip": 5,
+  "ips": [],
+  "used_emails": [],
+  "current_ip_index": 1
+}

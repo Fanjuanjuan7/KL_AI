@@ -1,0 +1,16 @@
+{
+  "emails": [
+    {
+      "email": "test1@example.com",
+      "password": "pass1",
+      "code_url": "http://acg-mail-tool.getcharzp.cn/newDetail?email=test1@example.com",
+      "status": "new"
+    },
+    {
+      "email": "test2@example.com",
+      "password": "pass2",
+      "code_url": "http://acg-mail-tool.getcharzp.cn/newDetail?email=test2@example.com",
+      "status": "new"
+    }
+  ]
+}
