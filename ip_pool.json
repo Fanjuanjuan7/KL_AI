@@ -1,5 +1,80 @@
 {
   "max_usage_per_ip": 5,
-  "ips": [],
-  "used_emails": []
+  "ips": [
+    {
+      "host": "47.82.150.94",
+      "port": "47682",
+      "proxyUserName": "UynqJZjUMD",
+      "proxyPassword": "F4qDNjjBHg",
+      "protocol": "socks5",
+      "used_by": [
+        "EceliaAlistreri2924@outlook.com",
+        "NnaAyert6606@outlook.com",
+        "AdArtmann7031@outlook.com",
+        "UtherUrphy2115@outlook.com"
+      ],
+      "usage_count": 4,
+      "last_updated": 1767935483
+    },
+    {
+      "host": "47.79.125.44",
+      "port": "47682",
+      "proxyUserName": "UynqJZjUMD",
+      "proxyPassword": "F4qDNjjBHg",
+      "protocol": "socks5",
+      "used_by": [
+        "UgustineOnnelly7857@outlook.com",
+        "OeliaArter3077@outlook.com",
+        "EstonAth6014@outlook.com"
+      ],
+      "usage_count": 3,
+      "last_updated": 1767935483
+    },
+    {
+      "host": "47.79.226.179",
+      "port": "47682",
+      "proxyUserName": "UynqJZjUMD",
+      "proxyPassword": "F4qDNjjBHg",
+      "protocol": "socks5",
+      "used_by": [
+        "LexandreEgmann9880@outlook.com",
+        "LovisErmiston2142@outlook.com",
+        "AmarcusRedovic6825@outlook.com",
+        "RestonArris2823@outlook.com"
+      ],
+      "usage_count": 4,
+      "last_updated": 1767936149
+    },
+    {
+      "host": "47.79.255.238",
+      "port": "47682",
+      "proxyUserName": "UynqJZjUMD",
+      "proxyPassword": "F4qDNjjBHg",
+      "protocol": "socks5",
+      "used_by": [
+        "IncereAlistreri7141@outlook.com",
+        "IbbieRiesen3708@outlook.com",
+        "OhannaArton1407@outlook.com",
+        "NtoniettaRuickshank4415@outlook.com"
+      ],
+      "usage_count": 4,
+      "last_updated": 1767925261
+    },
+    {
+      "host": "47.79.228.214",
+      "port": "47682",
+      "proxyUserName": "UynqJZjUMD",
+      "proxyPassword": "F4qDNjjBHg",
+      "protocol": "socks5",
+      "used_by": [
+        "ArvinOvacek1769@outlook.com",
+        "EstinArvin5276@outlook.com",
+        "LeonoreErmann9970@outlook.com"
+      ],
+      "usage_count": 3,
+      "last_updated": 1767935364
+    }
+  ],
+  "used_emails": [],
+  "current_ip_index": 3
 }

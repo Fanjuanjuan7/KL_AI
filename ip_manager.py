@@ -15,12 +15,75 @@ class IPManager:
             
         self.config_path = os.path.abspath(config_path)
         self.lock = threading.RLock()
+        self.active_ips = set() # Track IPs currently being used by running tasks
+        self.on_status_change = None
+        self.logger = None
         self.data: Dict[str, Any] = {
             "max_usage_per_ip": 5,
             "ips": [],
             "used_emails": []
         }
         self._load_config()
+        self.verify_consistency()
+
+    def set_logger(self, logger):
+        self.logger = logger
+
+    def _log(self, msg: str):
+        if self.logger:
+            try:
+                self.logger(f"[IPManager] {msg}")
+            except:
+                pass
+
+    def verify_consistency(self):
+        """
+        Verify and fix data consistency between usage_count and used_by list.
+        """
+        with self.lock:
+            fixed_count = 0
+            for ip in self.data["ips"]:
+                # Ensure used_by is a list
+                if not isinstance(ip.get("used_by"), list):
+                    ip["used_by"] = []
+                
+                real_count = len(ip["used_by"])
+                if ip.get("usage_count", 0) != real_count:
+                    ip["usage_count"] = real_count
+                    fixed_count += 1
+            
+            if fixed_count > 0:
+                self._log(f"Consistency check: Fixed usage counts for {fixed_count} IPs.")
+                self._save_config()
+
+    def validate_state(self) -> bool:
+        """
+        Validates internal state and sync with disk.
+        Returns True if consistent.
+        """
+        with self.lock:
+            # 1. Internal consistency
+            for ip in self.data["ips"]:
+                if len(ip.get("used_by", [])) != ip.get("usage_count", 0):
+                    self._log(f"Inconsistency found for IP {ip.get('host')}:{ip.get('port')}")
+                    return False
+            
+            # 2. Disk sync check
+            try:
+                if not os.path.exists(self.config_path):
+                    return False
+                with open(self.config_path, 'r', encoding='utf-8') as f:
+                    disk_data = json.load(f)
+                
+                # Check if important fields match
+                if len(disk_data.get("ips", [])) != len(self.data["ips"]):
+                     self._log("Disk data count mismatch")
+                     return False
+                     
+                return True
+            except Exception as e:
+                self._log(f"Validation error: {e}")
+                return False
 
     def _load_config(self):
         with self.lock:
@@ -59,11 +122,28 @@ class IPManager:
         with self.lock:
             # Auto-backup logic
             self._create_backup()
+            temp_path = self.config_path + ".tmp"
             try:
-                with open(self.config_path, 'w', encoding='utf-8') as f:
+                # Atomic write: write to temp file then rename
+                with open(temp_path, 'w', encoding='utf-8') as f:
                     json.dump(self.data, f, indent=2, ensure_ascii=False)
+                os.replace(temp_path, self.config_path)
             except Exception as e:
                 print(f"Error saving config: {e}")
+                if os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except:
+                        pass
+            
+            if self.on_status_change:
+                try:
+                    self.on_status_change()
+                except:
+                    pass
+
+    def set_on_status_change_callback(self, callback):
+        self.on_status_change = callback
 
     def _create_backup(self):
         """
@@ -174,6 +254,11 @@ class IPManager:
                         count += 1
             
             if count > 0:
+                # Prioritize new IPs: set current index to the start of new IPs
+                total_ips = len(self.data["ips"])
+                first_new_index = max(0, total_ips - count)
+                self.data["current_ip_index"] = first_new_index
+                self._log(f"Imported {count} new IPs. Reset allocation index to {first_new_index}.")
                 self._save_config()
             return count
 
@@ -243,7 +328,7 @@ class IPManager:
 
     def allocate_ip(self, email: str) -> Tuple[Optional[Dict[str, Any]], str]:
         """
-        Allocates an IP for the given email using Round-Robin strategy.
+        Allocates an IP for the given email using Strict Round Robin strategy based on usage status.
         Returns (ip_config, error_message)
         """
         with self.lock:
@@ -254,26 +339,44 @@ class IPManager:
 
             max_u = self.data.get("max_usage_per_ip", 5)
             ips = self.data["ips"]
-            if not ips:
+            total_ips = len(ips)
+            if total_ips == 0:
                 return None, "ip_exhausted"
 
+            # Strict Rotation: Start from current_ip_index and find first available
             start_index = self.data.get("current_ip_index", 0)
-            if start_index >= len(ips):
-                start_index = 0
-            
             candidate = None
-            found_index = -1
-
-            # Round-Robin Search
-            for i in range(len(ips)):
-                idx = (start_index + i) % len(ips)
+            
+            # Iterate once through the list
+            for i in range(total_ips):
+                idx = (start_index + i) % total_ips
                 ip = ips[idx]
-                if len(ip.get("used_by", [])) < max_u:
+                used_count = len(ip.get("used_by", []))
+                
+                # Check if IP is active (concurrency control)
+                ip_key = (ip["host"], str(ip["port"]))
+                if ip_key in self.active_ips:
+                    continue
+
+                if used_count < max_u:
                     candidate = ip
-                    found_index = idx
+                    # Update index for next time (round robin)
+                    self.data["current_ip_index"] = (idx + 1) % total_ips
                     break
             
             if not candidate:
+                # If we failed to find one, check if it's because they are all busy (active) or all full
+                any_capacity = False
+                for ip in ips:
+                    if len(ip.get("used_by", [])) < max_u:
+                        any_capacity = True
+                        break
+                
+                if any_capacity:
+                    # Capacity exists but currently locked
+                    return None, "ip_busy"
+
+                self._log("IP allocation failed: All IPs in pool have reached max usage.")
                 return None, "ip_exhausted"
             
             # Reserve it
@@ -281,24 +384,63 @@ class IPManager:
                 candidate["used_by"] = []
             candidate["used_by"].append(email)
             candidate["usage_count"] = len(candidate["used_by"])
+            candidate["last_updated"] = int(time.time())
             
-            # Update pointer to next IP for next allocation
-            self.data["current_ip_index"] = (found_index + 1) % len(ips)
+            # Add to active_ips
+            self.active_ips.add((candidate["host"], str(candidate["port"])))
             
+            self._log(f"Allocated IP {candidate['host']}:{candidate['port']} to {email}. Usage: {candidate['usage_count']}/{max_u}")
             self._save_config()
             
             return candidate, "success"
+
+    def update_ip_usage(self, host: str, port: str, new_count: int):
+        """
+        Manually update usage count.
+        If new_count < current, truncate used_by.
+        If new_count > current, add dummy entries.
+        """
+        with self.lock:
+            for ip in self.data["ips"]:
+                if ip["host"] == host and str(ip["port"]) == str(port):
+                    current_len = len(ip.get("used_by", []))
+                    new_count = max(0, int(new_count))
+                    
+                    if new_count < current_len:
+                        # Truncate
+                        ip["used_by"] = ip["used_by"][:new_count]
+                    elif new_count > current_len:
+                        # Add dummy
+                        diff = new_count - current_len
+                        for i in range(diff):
+                            ip["used_by"].append(f"manual_set_{int(time.time())}_{i}")
+                    
+                    ip["usage_count"] = len(ip["used_by"])
+                    ip["last_updated"] = int(time.time())
+                    self._log(f"Manually updated IP {host}:{port} usage to {ip['usage_count']}")
+                    self._save_config()
+                    break
+
+    def release_active_ip(self, host: str, port: str):
+        with self.lock:
+            key = (host, str(port))
+            if key in self.active_ips:
+                self.active_ips.remove(key)
+                # self._log(f"Released active lock for IP {host}:{port}")
 
     def release_ip(self, host: str, port: str, email: str):
         """
         Release an IP (remove email from used_by) if registration failed.
         """
         with self.lock:
+            self.release_active_ip(host, port)
             for ip in self.data["ips"]:
                 if ip["host"] == host and str(ip["port"]) == str(port):
                     if "used_by" in ip and email in ip["used_by"]:
                         ip["used_by"].remove(email)
                         ip["usage_count"] = len(ip["used_by"])
+                        ip["last_updated"] = int(time.time())
+                        self._log(f"Released IP {host}:{port} for {email}. Usage: {ip['usage_count']}")
                         self._save_config()
                     break
 

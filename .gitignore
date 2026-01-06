@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.DS_Store
+
+# User Data
+gui_config.json
+email_pool.json
+ip_pool.json
+*.csv
+!kl-mail.csv
+
+# Backups and Artifacts
+backups/
+test_artifacts/
+tests/
+dist/
+build/
+*.spec
+*.tmp
