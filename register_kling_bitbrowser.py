@@ -544,8 +544,53 @@ _SLIDER_PASS_CACHE: Dict[str, Dict[str, Any]] = {}
 def solve_slider(driver: webdriver.Remote, xpaths: Dict[str, str], timeout_ms: int, poll_ms: int, logger: Optional[Any] = None) -> bool:
     t0 = time.time()
     ok_xpath = xpaths.get('code_url_element') or xpaths.get('next_btn') or xpaths.get('password_input')
+
+    def _slider_container_visible(short_timeout_ms: int = 600) -> bool:
+        try:
+            try:
+                driver.switch_to.default_content()
+            except Exception:
+                pass
+            if element_visible(driver, xpaths['slider_container'], short_timeout_ms, poll_ms):
+                return True
+        except Exception:
+            pass
+        try:
+            try:
+                driver.switch_to.default_content()
+            except Exception:
+                pass
+            if element_exists(driver, xpaths['slider_iframe'], short_timeout_ms, poll_ms):
+                try:
+                    iframe = driver.find_element(By.XPATH, xpaths['slider_iframe'])
+                    driver.switch_to.frame(iframe)
+                except Exception:
+                    return False
+                try:
+                    return element_visible(driver, xpaths['slider_container'], short_timeout_ms, poll_ms)
+                finally:
+                    try:
+                        driver.switch_to.default_content()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return False
+
+    def _ok_visible(short_timeout_ms: int) -> bool:
+        if not ok_xpath:
+            return False
+        try:
+            try:
+                driver.switch_to.default_content()
+            except Exception:
+                pass
+            return element_visible(driver, ok_xpath, short_timeout_ms, poll_ms)
+        except Exception:
+            return False
+
     try:
-        if ok_xpath and element_exists(driver, ok_xpath, min(1500, timeout_ms), poll_ms):
+        if _ok_visible(min(1500, timeout_ms)):
             if logger:
                 logger("Slider: 已处于后续步骤，跳过滑块等待")
             return True
@@ -574,12 +619,11 @@ def solve_slider(driver: webdriver.Remote, xpaths: Dict[str, str], timeout_ms: i
     try:
         cached = _SLIDER_PASS_CACHE.get(cache_key) if cache_key else None
         if cached and (time.time() - float(cached.get('t') or 0.0) < 300.0):
-            iframe_now = element_visible(driver, xpaths['slider_iframe'], 500, poll_ms)
-            container_now = element_visible(driver, xpaths['slider_container'], 500, poll_ms)
-            if not (iframe_now or container_now):
+            if not _slider_container_visible(600):
                 if logger:
                     logger("Slider: 命中通过缓存，且当前未检测到滑块")
-                return bool(cached.get('ok') is True)
+                if cached.get('ok') is True:
+                    return True
     except Exception:
         pass
 
@@ -587,7 +631,7 @@ def solve_slider(driver: webdriver.Remote, xpaths: Dict[str, str], timeout_ms: i
     start = time.time()
     while (time.time() - start) * 1000 < appear_wait_ms:
         try:
-            if ok_xpath and element_exists(driver, ok_xpath, 800, poll_ms):
+            if _ok_visible(800):
                 if logger:
                     logger("Slider: 等待期间检测到后续步骤，视为通过")
                 if cache_key:
@@ -684,8 +728,7 @@ def solve_slider(driver: webdriver.Remote, xpaths: Dict[str, str], timeout_ms: i
                     moved += dx
                 actions.release().perform()
                 
-                # 优化: 优先检测成功标志 (Next Step)，且使用短超时避免阻塞
-                if ok_xpath and element_exists(driver, ok_xpath, 300, poll_ms):
+                if _ok_visible(1500):
                     if cache_key:
                         _SLIDER_PASS_CACHE[cache_key] = {'ok': True, 't': time.time()}
                     if logger:
@@ -697,18 +740,28 @@ def solve_slider(driver: webdriver.Remote, xpaths: Dict[str, str], timeout_ms: i
                 except Exception:
                     pass
 
-                # 优化: 高效检测滑块消失，避免 element_exists 在元素缺席时的长时间等待
-                # invisibility_of_element_located: 如果元素已消失则立即返回 True，否则等待超时
-                try:
-                    WebDriverWait(driver, 1.5).until(EC.invisibility_of_element_located((By.XPATH, xpaths['slider_container'])))
-                    if cache_key:
-                        _SLIDER_PASS_CACHE[cache_key] = {'ok': True, 't': time.time()}
-                    if logger:
-                        logger(f"Slider: 通过(弹窗消失)，耗时 {time.time() - t0:.2f}s")
-                    return True
-                except Exception:
-                    # 超时说明元素仍可见，继续重试
-                    pass
+                if not _slider_container_visible(600):
+                    if _ok_visible(1200):
+                        if cache_key:
+                            _SLIDER_PASS_CACHE[cache_key] = {'ok': True, 't': time.time()}
+                        if logger:
+                            logger(f"Slider: 通过(检测到后续元素)，耗时 {time.time() - t0:.2f}s")
+                        return True
+                    
+                    # 优化: 滑块消失且一段时间未重现，视为通过，避免死等后续元素导致重试
+                    time.sleep(1.0)
+                    if not _slider_container_visible(500):
+                         # 二次确认: 等待 3s 确保不是因刷新导致的短暂消失
+                         time.sleep(3.0)
+                         if not _slider_container_visible(500):
+                             if logger:
+                                 logger(f"Slider: 通过(滑块消失并确认)，耗时 {time.time() - t0:.2f}s")
+                             if cache_key:
+                                _SLIDER_PASS_CACHE[cache_key] = {'ok': True, 't': time.time()}
+                             return True
+
+                    time.sleep(0.4)
+                    continue
 
                 time.sleep(0.1)
             except Exception:
@@ -726,14 +779,12 @@ def solve_slider(driver: webdriver.Remote, xpaths: Dict[str, str], timeout_ms: i
         driver.switch_to.default_content()
     except Exception:
         pass
-    if ok_xpath and element_exists(driver, ok_xpath, min(5000, timeout_ms), poll_ms):
+    if _ok_visible(min(5000, timeout_ms)):
         if cache_key:
             _SLIDER_PASS_CACHE[cache_key] = {'ok': True, 't': time.time()}
         if logger:
             logger(f"Slider: 通过(最终兜底检测)，耗时 {time.time() - t0:.2f}s")
         return True
-    if cache_key:
-        _SLIDER_PASS_CACHE[cache_key] = {'ok': False, 't': time.time()}
     if logger:
         logger(f"Slider: 失败，耗时 {time.time() - t0:.2f}s")
         log_page_timing(driver, logger)
@@ -941,14 +992,22 @@ def extract_verification_code_flow(driver: webdriver.Remote, code_url: str, code
                         pass
                 time.sleep(1)
         
-        driver.close()
-        driver.switch_to.window(main_handle)
+        try:
+            if len(driver.window_handles) > 1:
+                driver.close()
+        except Exception:
+            pass
+        try:
+            driver.switch_to.window(main_handle)
+        except Exception:
+            pass
         return code
     except Exception as e:
         if logger:
             logger(f"接码流程异常: {e}")
         try:
-            driver.close()
+            if len(driver.window_handles) > 1:
+                driver.close()
         except Exception:
             pass
         try:
@@ -1533,16 +1592,41 @@ def perform_registration(
             logger("步骤: 等待并通过滑块")
         if stop_event and stop_event.is_set():
             return False, 'stopped'
+        code_input_el_xpath = xpaths.get('code_url_element')
+        if not code_input_el_xpath:
+            return False, 'code_input_xpath_missing'
         t_slider = time.time()
-        if not solve_slider(driver, xpaths, current_timeout, current_poll, logger=logger):
-            try:
-                if element_exists(driver, xpaths['next_btn'], min(current_timeout, 5000), current_poll):
-                    find_click_any(driver, xpaths['next_btn'], current_timeout, current_poll)
-                time.sleep(2)
-            except Exception:
-                pass
-            if not solve_slider(driver, xpaths, current_timeout, current_poll, logger=logger):
-                return False, 'slider_failed'
+        slider_ok = False
+        max_slider_retries = 8
+        slider_iframe_xpath = xpaths.get('slider_iframe')
+        slider_container_xpath = xpaths.get('slider_container')
+        for attempt in range(max_slider_retries):
+            if stop_event and stop_event.is_set():
+                return False, 'stopped'
+            if attempt > 0 and logger:
+                logger(f"Slider: 重试 {attempt+1}/{max_slider_retries}")
+            if solve_slider(driver, xpaths, current_timeout, current_poll, logger=logger):
+                slider_ok = True
+                break
+            if attempt < max_slider_retries - 1:
+                try:
+                    try:
+                        driver.switch_to.default_content()
+                    except Exception:
+                        pass
+                    t_wait = time.time()
+                    while time.time() - t_wait < 6:
+                        if stop_event and stop_event.is_set():
+                            return False, 'stopped'
+                        if element_visible(driver, code_input_el_xpath, 400, current_poll):
+                            break
+                        if (slider_iframe_xpath and element_visible(driver, slider_iframe_xpath, 400, current_poll)) or (slider_container_xpath and element_visible(driver, slider_container_xpath, 400, current_poll)):
+                            break
+                        time.sleep(0.3)
+                except Exception:
+                    pass
+        if not slider_ok:
+            return False, 'slider_failed'
         if logger:
             logger(f"步骤: 滑块通过 (耗时 {time.time()-t_slider:.2f}s)")
             try:
@@ -1552,22 +1636,30 @@ def perform_registration(
         if logger:
             logger("步骤: 等待验证码输入框出现并获取验证码")
         
-        # 1. Wait for code input element FIRST (Immediate Trigger)
         try:
             t0 = time.time()
-            if logger: logger("开始检测验证码输入框...")
-            WebDriverWait(driver, min(current_timeout, 20000) / 1000.0).until(EC.presence_of_element_located((By.XPATH, xpaths['code_url_element'])))
-            if logger: logger(f"检测到验证码输入框 (耗时 {time.time()-t0:.2f}s)，立即触发接码")
+            if logger:
+                logger("开始检测验证码输入框(可见)...")
+            # Increase timeout to 180s to accommodate slow page transitions after slider
+            wait_limit = min(current_timeout, 180000)
+            WebDriverWait(driver, wait_limit / 1000.0).until(
+                EC.visibility_of_element_located((By.XPATH, code_input_el_xpath))
+            )
+            if logger:
+                logger(f"检测到验证码输入框(可见) (耗时 {time.time()-t0:.2f}s)，开始接码")
         except Exception:
-            if logger: logger("等待验证码输入框超时，尝试直接接码")
+            if logger:
+                logger("验证码输入框未出现(或不可见)，不触发接码")
             try:
                 log_resource_phase_timings(driver, logger, contains="verify", limit=30)
             except Exception:
                 pass
+            return False, 'code_input_not_visible'
 
         # 2. Extract code with timeout
         if logger: logger("开始调用接码流程...")
-        code = extract_verification_code_flow(driver, code_url, xpaths.get('code_input'), logger, open_data.get('http'), timeout=60)
+        # Increase extraction timeout to 120s
+        code = extract_verification_code_flow(driver, code_url, xpaths.get('code_input'), logger, open_data.get('http'), timeout=120)
         if not code:
             if logger:
                 logger("步骤: 获取验证码失败")
@@ -1577,7 +1669,9 @@ def perform_registration(
             logger("步骤: 获取验证码成功")
         
         # 3. Input code
-        WebDriverWait(driver, min(current_timeout, 10000) / 1000.0).until(EC.presence_of_element_located((By.XPATH, xpaths['code_url_element']))).send_keys(code)
+        WebDriverWait(driver, min(current_timeout, 10000) / 1000.0).until(
+            EC.visibility_of_element_located((By.XPATH, code_input_el_xpath))
+        ).send_keys(code)
         if logger:
             logger("步骤: 填写验证码")
         
