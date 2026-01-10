@@ -50,6 +50,10 @@ class BitBrowserClient:
             'proxyMethod': 2,
             'proxyType': 'noproxy',
             'isUDP': 1 if enable_udp else 0,
+            'syncTabs': True,
+            'syncCookies': True,
+            'syncLocalStorage': True,
+            'syncIndexedDb': True,
             'browserFingerPrint': {
                 'coreVersion': '124'
             }
@@ -77,6 +81,10 @@ class BitBrowserClient:
             'proxyMethod': 2,
             'proxyType': 'noproxy',
             'isUDP': 1 if enable_udp else 0,
+            'syncTabs': True,
+            'syncCookies': True,
+            'syncLocalStorage': True,
+            'syncIndexedDb': True,
             'browserFingerPrint': {
                 'coreVersion': '124'
             }
@@ -1327,6 +1335,7 @@ def perform_registration(
         logger(f"create_profile {window_name}")
     browser_id = None
     driver = None
+    result_ok = False
     try:
         browser_id = client.update_browser(window_name, proxy_payload(host, port, proxy_username, proxy_password, protocol))
     except Exception:
@@ -1648,6 +1657,29 @@ def perform_registration(
             if logger:
                 logger(f"检测到验证码输入框(可见) (耗时 {time.time()-t0:.2f}s)，开始接码")
         except Exception:
+            # 增强诊断：检查是否滑块重现或有错误提示
+            if logger:
+                logger("验证码输入框等待超时，进行环境诊断...")
+            
+            # 1. Check if slider reappeared
+            try:
+                if (slider_iframe_xpath and element_visible(driver, slider_iframe_xpath, 1000, current_poll)) or \
+                   (slider_container_xpath and element_visible(driver, slider_container_xpath, 1000, current_poll)):
+                    if logger: logger("诊断: 滑块验证框重新出现，判定为滑块失败")
+                    return False, 'slider_reappeared'
+            except Exception:
+                pass
+
+            # 2. Check for error messages
+            try:
+                body_text = driver.find_element(By.TAG_NAME, 'body').text
+                if "frequent" in body_text.lower() or "try again" in body_text.lower():
+                     if logger: logger(f"诊断: 页面包含错误提示")
+            except Exception:
+                pass
+            
+            take_screenshot(driver, f"{window_name}_code_input_timeout.png", logger)
+            
             if logger:
                 logger("验证码输入框未出现(或不可见)，不触发接码")
             try:
@@ -1841,23 +1873,28 @@ def perform_registration(
             else:
                 logger(f"因失败且未达到最小保持时间({keep_open_on_failure_ms}ms)，暂不关闭窗口")
         
-        try:
-            if browser_id and not hold_close:
-                client.close_browser(browser_id)
-                if logger: logger(f"已请求关闭浏览器: {browser_id}")
-        except Exception as e:
-            if logger: logger(f"close_browser error: {e}")
-
+        # 优先使用 driver.quit() 关闭窗口，这通常比 API 更干净
         try:
             if driver and not hold_close:
                 # 检查连接是否还在，如果还在则退出
                 try:
                     driver.quit()
+                    if logger: logger("driver.quit() 执行完成")
                 except Exception:
                     pass
         except Exception as e:
             if logger: logger(f"driver.quit error: {e}")
-            
+
+        try:
+            if browser_id and not hold_close:
+                if result_ok:
+                    if logger: logger("注册成功，等待数据同步...")
+                    time.sleep(3)
+                client.close_browser(browser_id)
+                if logger: logger(f"已请求关闭浏览器API: {browser_id}")
+        except Exception as e:
+            if logger: logger(f"close_browser error: {e}")
+
         # 必须删除未成功的窗口
         if browser_id and not result_ok:
             if logger:
@@ -1872,7 +1909,7 @@ def perform_registration(
                 except Exception as del_err:
                     if logger:
                         logger(f"删除窗口失败(重试): {del_err}")
-                    time.sleep(0.5)
+                    time.sleep(2.0)
 
 
 def run_batch(
@@ -2056,7 +2093,7 @@ def run_batch(
                     udp_enabled=udp_enabled,
                     email_manager=email_manager,
                     keep_open_on_failure_ms=0,
-                    allow_hold_on_early_failure=True,
+                    allow_hold_on_early_failure=False,
                 )
                 if not ok:
                     if logger:
@@ -2099,7 +2136,8 @@ def run_batch(
                         elif msg == 'email_used_prompt':
                             email_manager.update_email_status(email, 'fail_used')
                         else:
-                            email_manager.update_email_status(email, 'fail')
+                            # User requested to reset to unused on failure
+                            email_manager.update_email_status(email, 'new')
         finally:
              if ip_manager and 'ip_entry' in locals() and ip_entry:
                  ip_manager.release_active_ip(ip_entry['host'], ip_entry['port'])

@@ -2,65 +2,69 @@
   "max_usage_per_ip": 5,
   "ips": [
     {
-      "host": "47.79.150.139",
+      "host": "47.79.136.220",
       "port": "47682",
       "proxyUserName": "UynqJZjUMD",
       "proxyPassword": "F4qDNjjBHg",
       "protocol": "socks5",
       "used_by": [
-        "ObertaAndervort9383@outlook.com",
-        "LmerTehr5720@outlook.com"
+        "AliaAy0268@outlook.com",
+        "AllenGraham5860@outlook.com",
+        "DanielMayer7172@outlook.com"
+      ],
+      "usage_count": 3,
+      "last_updated": 1768014456
+    },
+    {
+      "host": "47.79.144.10",
+      "port": "47682",
+      "proxyUserName": "UynqJZjUMD",
+      "proxyPassword": "F4qDNjjBHg",
+      "protocol": "socks5",
+      "used_by": [
+        "ManuelWood1784@outlook.com"
+      ],
+      "usage_count": 1,
+      "last_updated": 1768014456
+    },
+    {
+      "host": "47.79.136.133",
+      "port": "47682",
+      "proxyUserName": "UynqJZjUMD",
+      "proxyPassword": "F4qDNjjBHg",
+      "protocol": "socks5",
+      "used_by": [
+        "JessicaPowell6149@outlook.com",
+        "JeremiahMaldonado5346@outlook.com"
       ],
       "usage_count": 2,
-      "last_updated": 1767965158
+      "last_updated": 1768014300
     },
     {
-      "host": "47.79.93.160",
+      "host": "47.79.94.231",
       "port": "47682",
       "proxyUserName": "UynqJZjUMD",
       "proxyPassword": "F4qDNjjBHg",
       "protocol": "socks5",
       "used_by": [
-        "AmelAne2841@outlook.com"
+        "ReneeFowler9486@outlook.com",
+        "AnnPayne5546@outlook.com"
       ],
-      "usage_count": 1,
-      "last_updated": 1767963021
+      "usage_count": 2,
+      "last_updated": 1768014456
     },
     {
-      "host": "47.79.36.19",
+      "host": "47.79.149.174",
       "port": "47682",
       "proxyUserName": "UynqJZjUMD",
       "proxyPassword": "F4qDNjjBHg",
       "protocol": "socks5",
       "used_by": [
-        "ErelUel2957@outlook.com"
+        "MaryWilson9015@outlook.com",
+        "LarryPark9095@outlook.com"
       ],
-      "usage_count": 1,
-      "last_updated": 1767963257
-    },
-    {
-      "host": "47.79.148.8",
-      "port": "47682",
-      "proxyUserName": "UynqJZjUMD",
-      "proxyPassword": "F4qDNjjBHg",
-      "protocol": "socks5",
-      "used_by": [
-        "IyanaReitenberg3018@outlook.com"
-      ],
-      "usage_count": 1,
-      "last_updated": 1767965101
-    },
-    {
-      "host": "47.79.149.22",
-      "port": "47682",
-      "proxyUserName": "UynqJZjUMD",
-      "proxyPassword": "F4qDNjjBHg",
-      "protocol": "socks5",
-      "used_by": [
-        "EannaRuen6225@outlook.com"
-      ],
-      "usage_count": 1,
-      "last_updated": 1767965101
+      "usage_count": 2,
+      "last_updated": 1768014456
     }
   ],
   "used_emails": [],
