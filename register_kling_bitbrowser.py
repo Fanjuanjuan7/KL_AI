@@ -990,11 +990,11 @@ def extract_verification_code_flow(driver: webdriver.Remote, code_url: str, code
                 pass
             
             if not code:
-                # 每隔5秒刷新一次，避免频繁刷新
-                if int(time.time()) % 5 == 0:
+                # 每隔3秒刷新一次 (用户要求)
+                if int(time.time()) % 3 == 0:
                     try:
                         driver.refresh()
-                        if logger: logger("刷新接码页面...")
+                        if logger: logger("刷新接码页面(3s间隔)...")
                         WebDriverWait(driver, 5).until(lambda d: d.execute_script("return document.readyState") in ("interactive", "complete"))
                     except Exception:
                         pass
@@ -1642,65 +1642,61 @@ def perform_registration(
                 log_resource_phase_timings(driver, logger, contains="captcha", limit=30)
             except Exception:
                 pass
+        # 优化: 滑块通过后，直接跳转接码页等待验证码
         if logger:
-            logger("步骤: 等待验证码输入框出现并获取验证码")
+            logger("步骤: 滑块通过，立即跳转接码页等待验证码")
         
-        try:
-            t0 = time.time()
+        # 在等待过程中动态检查停止与目标达成
+        if stop_event and stop_event.is_set():
+            return False, 'stopped'
+        if target_check and target_check():
+            if logger: logger("终止接码：已达到目标注册数量")
+            return False, 'target_reached'
+
+        # 直接调用接码流程 (内部负责打开、刷新、提取)
+        code = extract_verification_code_flow(driver, code_url, xpaths.get('code_input'), logger, open_data.get('http'), timeout=60)
+        
+        if not code:
             if logger:
-                logger("开始检测验证码输入框(可见)...")
-            # Increase timeout to 180s to accommodate slow page transitions after slider
-            wait_limit = min(current_timeout, 180000)
-            WebDriverWait(driver, wait_limit / 1000.0).until(
-                EC.visibility_of_element_located((By.XPATH, code_input_el_xpath))
-            )
-            if logger:
-                logger(f"检测到验证码输入框(可见) (耗时 {time.time()-t0:.2f}s)，开始接码")
-        except Exception:
-            # 增强诊断：检查是否滑块重现或有错误提示
-            if logger:
-                logger("验证码输入框等待超时，进行环境诊断...")
-            
-            # 1. Check if slider reappeared
+                logger("步骤: 获取验证码失败(超时)")
+            # 诊断: 检查是否滑块重现(导致根本没发码)
             try:
                 if (slider_iframe_xpath and element_visible(driver, slider_iframe_xpath, 1000, current_poll)) or \
                    (slider_container_xpath and element_visible(driver, slider_container_xpath, 1000, current_poll)):
-                    if logger: logger("诊断: 滑块验证框重新出现，判定为滑块失败")
+                    if logger: logger("诊断: 滑块验证框重新出现，判定为滑块实际上未通过")
                     return False, 'slider_reappeared'
             except Exception:
                 pass
+            return False, 'code_not_found'
 
-            # 2. Check for error messages
+        gate_state = 'code_received'
+        if logger:
+            logger("步骤: 获取验证码成功，已切回主窗口")
+
+        # 3. 拿到验证码后，等待输入框出现并填入
+        try:
+            t0 = time.time()
+            if logger: logger("正在等待验证码输入框...")
+            # 因为之前已经等待了验证码提取时间，这里通常应该已经就绪，但为了稳健仍给予等待
+            WebDriverWait(driver, 10).until(
+                EC.visibility_of_element_located((By.XPATH, code_input_el_xpath))
+            )
+            if logger: logger(f"验证码输入框就绪 (耗时 {time.time()-t0:.2f}s)")
+        except Exception:
+            if logger: logger("验证码输入框未出现(超时)")
+            # 再次诊断
             try:
                 body_text = driver.find_element(By.TAG_NAME, 'body').text
                 if "frequent" in body_text.lower() or "try again" in body_text.lower():
                      if logger: logger(f"诊断: 页面包含错误提示")
             except Exception:
                 pass
-            
-            take_screenshot(driver, f"{window_name}_code_input_timeout.png", logger)
-            
-            if logger:
-                logger("验证码输入框未出现(或不可见)，不触发接码")
-            try:
-                log_resource_phase_timings(driver, logger, contains="verify", limit=30)
-            except Exception:
-                pass
             return False, 'code_input_not_visible'
-
-        # 2. Extract code with timeout
-        if logger: logger("开始调用接码流程...")
-        # Increase extraction timeout to 120s
-        code = extract_verification_code_flow(driver, code_url, xpaths.get('code_input'), logger, open_data.get('http'), timeout=120)
-        if not code:
-            if logger:
-                logger("步骤: 获取验证码失败")
-            return False, 'code_not_found'
-        gate_state = 'code_received'
-        if logger:
-            logger("步骤: 获取验证码成功")
         
         # 3. Input code
+        if target_check and target_check():
+            if logger: logger("终止提交：已达到目标注册数量")
+            return False, 'target_reached'
         WebDriverWait(driver, min(current_timeout, 10000) / 1000.0).until(
             EC.visibility_of_element_located((By.XPATH, code_input_el_xpath))
         ).send_keys(code)
@@ -1712,6 +1708,9 @@ def perform_registration(
              if logger: logger(f"提交前检测: 邮箱 {email} 已被注册")
              return False, 'email_already_registered_secondary'
 
+        if target_check and target_check():
+            if logger: logger("终止提交：已达到目标注册数量")
+            return False, 'target_reached'
         find_click_any(driver, xpaths['final_submit_btn'], current_timeout, current_poll)
         try:
             log_performance_network(driver, logger, 100, domain_filter=None)
@@ -1933,6 +1932,8 @@ def run_batch(
 ) -> None:
     rows = read_rows(input_path)
     if not rows:
+        if logger:
+            logger("未发现可处理的任务行，直接退出")
         return
     if stop_event is None:
         stop_event = threading.Event()
@@ -1941,38 +1942,21 @@ def run_batch(
     client = BitBrowserClient(base_url, secret)
     def _ping(url: str) -> bool:
         try:
-            # Use lightweight health check if possible, fallback to update which is what was used
-            # But user reported 405. Let's try /browser/list with page 0 to see if it responds?
-            # Or just use the original call but with new wrapper to see logging.
-            payload = {'name': 'health-check', 'proxyMethod': 2, 'proxyType': 'noproxy', 'browserFingerPrint': {'coreVersion': '124'}}
-            # Note: _request is method of instance 'client', but here we are pinging 'url' which might be different from client.base_url
-            # So we manually do it but use same logic
+            # 优化: 使用 list 接口代替 update/create 来进行健康检查，避免产生残留窗口
+            payload = {'page': 0, 'pageSize': 1}
             h = client._headers()
-            r = requests.post(f"{url.rstrip('/')}/browser/update", headers=h, data=json.dumps(payload), timeout=5)
-            if r.status_code == 405:
-                print(f"Ping 405: {url}")
-            r.raise_for_status()
-            try:
-                data = r.json()
-                d = data.get('data')
-                bid = None
-                if isinstance(d, dict):
-                    bid = d.get('id')
-                elif isinstance(d, str):
-                    bid = d
-                if not bid:
-                    bid = data.get('id')
-                if bid:
-                    try:
-                        requests.post(f"{url.rstrip('/')}/browser/delete", headers=h, data=json.dumps({'id': bid}), timeout=5)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            return True
-        except Exception as e:
-            # print(f"Ping failed {url}: {e}")
+            r = requests.post(f"{url.rstrip('/')}/browser/list", headers=h, data=json.dumps(payload), timeout=5)
+            if r.status_code == 200:
+                try:
+                    r.json()
+                    return True
+                except:
+                    pass
             return False
+        except Exception as e:
+            return False
+    if logger:
+        logger("开始进行比特浏览器接口连通性检查 (health-check)")
     if not _ping(client.base_url):
         candidates = [client.base_url] + [f"http://127.0.0.1:{p}" for p in (54345, 54346, 54321, 54322, 50325, 55555)]
         for c in candidates:
@@ -1988,6 +1972,22 @@ def run_batch(
     
     lock = threading.Lock()
     global_success_count = 0
+
+    # 资源预检查: 估算当前 IP 池和邮箱池最大可支持的注册数量
+    # 说明: 这里只做告警与日志输出，不改变原有业务决策逻辑
+    try:
+        ip_stats = ip_manager.get_stats() if ip_manager else None
+    except Exception:
+        ip_stats = None
+    try:
+        email_total = len(rows)
+    except Exception:
+        email_total = 0
+    if logger:
+        if ip_stats:
+            logger(f"资源预检查: IP池总数={ip_stats['total_ips']}, 剩余可用名额={ip_stats['remaining_usage_count']}, 邮箱任务数={email_total}, 目标成功数={target_success_count}")
+        else:
+            logger(f"资源预检查: 无IP池(或读取失败)，邮箱任务数={email_total}, 目标成功数={target_success_count}")
     
     def task(idx: int, r: Dict[str, Any]) -> Tuple[int, bool, str]:
         nonlocal global_success_count
