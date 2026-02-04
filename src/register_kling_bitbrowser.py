@@ -3,8 +3,11 @@ import os
 import re
 import time
 import threading
+import psutil
+import socks
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple, Callable
+from dataclasses import dataclass
 
 import requests
 import urllib.parse
@@ -14,11 +17,32 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
+try:
+    from src.captcha_receiver import MailExtractor
+    from src.email_pool import EmailPool
+except ImportError:
+    from captcha_receiver import MailExtractor
+    from email_pool import EmailPool
+
+
+
+@dataclass
+class RegistrationEvents:
+    on_success: Optional[Callable[[str], None]] = None  # email
+    on_failure: Optional[Callable[[str, str], None]] = None  # email, reason
+    on_log: Optional[Callable[[str], None]] = None
+    on_finish: Optional[Callable[[str, bool, str], None]] = None # email, success, message
+
 
 class BitBrowserClient:
     def __init__(self, base_url: str, secret: Optional[str] = None):
         self.base_url = base_url.rstrip('/')
         self.secret = secret
+        self.session = requests.Session()
+        # Optimize connection pool
+        adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=3)
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
 
     def _headers(self) -> Dict[str, str]:
         h = {'Content-Type': 'application/json', 'Accept': 'application/json'}
@@ -29,11 +53,17 @@ class BitBrowserClient:
     def _request(self, method: str, endpoint: str, data: Optional[Dict[str, Any]] = None, timeout: int = 30) -> requests.Response:
         url = f"{self.base_url}{endpoint}"
         try:
+            t0 = time.time()
             if method.upper() == 'POST':
-                r = requests.post(url, headers=self._headers(), data=json.dumps(data) if data else None, timeout=timeout)
+                r = self.session.post(url, headers=self._headers(), data=json.dumps(data) if data else None, timeout=timeout)
             else:
-                r = requests.get(url, headers=self._headers(), timeout=timeout)
+                r = self.session.get(url, headers=self._headers(), timeout=timeout)
             
+            # Log slow requests
+            elapsed = time.time() - t0
+            if elapsed > 1.0:
+                 print(f"Slow BitBrowser API: {method} {endpoint} took {elapsed:.2f}s")
+
             if r.status_code == 405:
                 print(f"HTTP 405 Method Not Allowed: {method} {url}")
             r.raise_for_status()
@@ -43,7 +73,7 @@ class BitBrowserClient:
                 print(f"HTTP 405 Error Details: {method} {url} - {e.response.text}")
             raise e
 
-    def update_browser(self, name: str, proxy: Optional[Dict[str, Any]] = None, enable_udp: bool = False) -> str:
+    def update_browser(self, name: str, proxy: Optional[Dict[str, Any]] = None, enable_udp: bool = False, cmd_args: Optional[List[str]] = None) -> str:
         payload: Dict[str, Any] = {
             'name': name,
             'remark': '',
@@ -58,6 +88,8 @@ class BitBrowserClient:
                 'coreVersion': '124'
             }
         }
+        if cmd_args:
+            payload['cmdArgs'] = cmd_args
         if proxy:
             payload.update(proxy)
         r = self._request('POST', '/browser/update', payload, timeout=30)
@@ -74,7 +106,7 @@ class BitBrowserClient:
             raise RuntimeError(f"update_browser failed: {data}")
         return bid
 
-    def create_browser(self, name: str, proxy: Optional[Dict[str, Any]] = None, enable_udp: bool = False) -> str:
+    def create_browser(self, name: str, proxy: Optional[Dict[str, Any]] = None, enable_udp: bool = False, cmd_args: Optional[List[str]] = None) -> str:
         payload: Dict[str, Any] = {
             'name': name,
             'remark': '',
@@ -89,6 +121,8 @@ class BitBrowserClient:
                 'coreVersion': '124'
             }
         }
+        if cmd_args:
+            payload['cmdArgs'] = cmd_args
         if proxy:
             payload.update(proxy)
         r = self._request('POST', '/browser/create', payload, timeout=30)
@@ -116,7 +150,7 @@ class BitBrowserClient:
 
     def close_browser(self, browser_id: str) -> None:
         try:
-            self._request('POST', '/browser/close', {'id': browser_id}, timeout=30)
+            self._request('POST', '/browser/close', {'id': browser_id}, timeout=10)
         except Exception:
             pass
 
@@ -139,6 +173,20 @@ class BitBrowserClient:
 
 
 def read_rows(input_path: str) -> List[Dict[str, Any]]:
+    # Check for "----" format (New EmailPool format)
+    try:
+        with open(input_path, 'r', encoding='utf-8') as f:
+            first_line = f.readline()
+            if '----' in first_line:
+                try:
+                    from src.email_pool import EmailPool
+                    pool = EmailPool(input_path)
+                    return pool.get_all_rows()
+                except ImportError:
+                    pass
+    except Exception:
+        pass
+
     if input_path.lower().endswith('.csv'):
         import csv
         rows: List[Dict[str, Any]] = []
@@ -284,6 +332,16 @@ def log_resource_status(driver: webdriver.Remote, logger: Optional[Any], limit: 
             logger(f"Resources: total={total}, counts={json.dumps(counts, ensure_ascii=False)}")
         except Exception:
             logger(f"Resources: total={total}")
+    except Exception:
+        pass
+
+def log_memory_usage(logger: Optional[Any] = None) -> None:
+    if not logger: return
+    try:
+        process = psutil.Process(os.getpid())
+        mem_info = process.memory_info()
+        rss_mb = mem_info.rss / 1024 / 1024
+        logger(f"当前进程内存占用: {rss_mb:.2f} MB")
     except Exception:
         pass
 
@@ -892,137 +950,129 @@ def extract_code_attempts(driver: webdriver.Remote, xpath: Optional[str], logger
     return code
 
 
-def extract_verification_code_flow(driver: webdriver.Remote, code_url: str, code_xpath: Optional[str], logger: Optional[Any], debugger_http: Optional[str] = None, timeout: int = 60) -> Optional[str]:
+def extract_verification_code_flow(driver: webdriver.Remote, code_url: str, code_xpath: Optional[str], logger: Optional[Any], debugger_http: Optional[str] = None, timeout: int = 400, resend_xpath: Optional[str] = None) -> Optional[str]:
+    """
+    Robust verification code retrieval with retry mechanism.
+    Flow:
+      Loop (Max 4 times):
+        1. Wait 10s for code (poll 3s).
+        2. If not found -> Refresh -> Wait 10s.
+        3. If still not found -> Switch to Main Tab -> Click Resend -> Wait 2s -> Switch back.
+    """
     main_handle = driver.current_window_handle
+    start_time = time.time()
+    max_retries = 4
+    
+    # Configuration
+    INITIAL_WAIT = 10
+    REFRESH_WAIT = 10
+    RESEND_WAIT = 2
+    
+    # Open Code Tab initially
+    code_tab_handle = None
+    
     try:
-        # Set shorter page load timeout for verification code page
-        driver.set_page_load_timeout(20)
+        # Create new tab for code
+        driver.switch_to.new_window('tab')
+        code_tab_handle = driver.current_window_handle
         
-        # 立即开始尝试，无需额外等待
-        for open_try in range(3):
-            t_start = time.time()
-            created = False
-            prev_len = len(driver.window_handles)
-            if debugger_http:
-                try:
-                    created = create_cdp_tab(debugger_http, code_url, logger)
-                except Exception as e:
-                    if logger:
-                        logger(f"调试接口创建失败: {e}")
-            if created:
-                try:
-                    WebDriverWait(driver, 3).until(lambda d: len(d.window_handles) > prev_len)
-                    driver.switch_to.window(driver.window_handles[-1])
-                    if logger:
-                        try:
-                            logger(f"已切换到新标签: {driver.current_url}")
-                        except Exception:
-                            logger("已切换到新标签")
-                except Exception:
-                    created = False
-            if not created:
-                driver.switch_to.new_window('tab')
-                if logger:
-                    logger(f"打开接码链接: {code_url}")
-                try:
-                    driver.get(code_url)
-                except Exception as nav_err:
-                    if logger:
-                        logger(f"导航失败: {nav_err}")
-                    try:
-                        driver.execute_script("window.location.href=arguments[0];", code_url)
-                    except Exception:
-                        pass
-            
-            if logger: logger(f"页面打开耗时: {time.time()-t_start:.2f}s")
-            
-            loaded = False
-            try:
-                WebDriverWait(driver, 5).until(lambda d: d.execute_script("return document.readyState") in ("interactive", "complete"))
-                loaded = True
-                if logger:
-                    logger("接码页已加载")
-            except Exception:
-                if logger:
-                    logger("接码页加载超时")
-            if loaded:
+        # Navigate to code URL
+        if logger: logger(f"打开接码页面: {code_url}")
+        try:
+            driver.get(code_url)
+        except Exception as e:
+            if logger: logger(f"打开接码页面异常: {e}")
+            # Try JS open as fallback if needed, but get() is standard
+        
+        for attempt in range(max_retries):
+            # Check execution time
+            if time.time() - start_time > timeout:
+                if logger: logger("验证码获取超时 (总时间限制)")
                 break
+                
+            if logger: logger(f"=== 接码尝试轮次 {attempt + 1}/{max_retries} ===")
+            
+            # 1. First Detection (10s)
+            if logger: logger(f"开始检测验证码 ({INITIAL_WAIT}s)...")
+            code = wait_extract_code(driver, code_xpath, max_wait_sec=INITIAL_WAIT, logger=logger)
+            if code:
+                if logger: logger(f"验证码获取成功: {code}")
+                try:
+                    driver.close() # Close code tab
+                    driver.switch_to.window(main_handle)
+                except: pass
+                return code
+            
+            # 2. Refresh & Second Detection
+            if logger: logger("未检测到验证码，刷新页面...")
             try:
                 driver.refresh()
-            except Exception:
-                pass
-            time.sleep(0.5)
+                # Wait for ready state
+                try:
+                    WebDriverWait(driver, 5).until(lambda d: d.execute_script("return document.readyState") == "complete")
+                except: pass
+            except Exception as e:
+                if logger: logger(f"刷新失败: {e}")
+                
+            if logger: logger(f"刷新后检测验证码 ({REFRESH_WAIT}s)...")
+            code = wait_extract_code(driver, code_xpath, max_wait_sec=REFRESH_WAIT, logger=logger)
+            if code:
+                if logger: logger(f"验证码获取成功 (刷新后): {code}")
+                try:
+                    driver.close()
+                    driver.switch_to.window(main_handle)
+                except: pass
+                return code
             
-        code: Optional[str] = None
-        # 使用总体超时控制
-        end_time = time.time() + timeout
-        
-        while time.time() < end_time and not code:
-            try:
-                if code_xpath:
-                    try:
-                        el = WebDriverWait(driver, 1).until(EC.presence_of_element_located((By.XPATH, code_xpath)))
-                        txt = (el.text or el.get_attribute('value') or '').strip()
-                        if logger:
-                            logger(f"元素文本: '{txt}'")
-                        m = re.search(r"\b(\d{6})\b", txt)
-                        if m:
-                            code = m.group(1)
-                            break
-                        clean = txt.replace(' ', '').replace('\n', '')
-                        if clean.isdigit() and len(clean) == 6:
-                            code = clean
-                            break
-                    except Exception:
-                        pass
-                if not code:
-                    try:
-                        body_txt = driver.find_element(By.TAG_NAME, 'body').text
-                        m2 = re.search(r"\b(\d{6})\b", body_txt)
-                        if m2:
-                            code = m2.group(1)
-                            if logger:
-                                logger(f"页面文本提取验证码: {code}")
-                            break
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            
-            if not code:
-                # 每隔3秒刷新一次 (用户要求)
-                if int(time.time()) % 3 == 0:
-                    try:
+            # 3. Resend Flow (if not last attempt)
+            if attempt < max_retries - 1:
+                if logger: logger("仍未检测到，执行重发流程...")
+                try:
+                    # Switch to Main Tab
+                    driver.switch_to.window(main_handle)
+                    
+                    # Locate and Click Resend
+                    resend_xp = resend_xpath or "//a[contains(text(), 'Resend Code')]"
+                    if logger: logger(f"查找重发按钮: {resend_xp}")
+                    
+                    clicked = safe_click_any(driver, [resend_xp, "//*[contains(text(), 'Resend')]", "//*[contains(@class, 'highlight')]"], 5000, 1000, logger)
+                    
+                    if clicked:
+                        if logger: logger(f"已点击重发按钮，等待 {RESEND_WAIT}s...")
+                        time.sleep(RESEND_WAIT)
+                    else:
+                        if logger: logger("❌ 未找到重发按钮，跳过重发步骤")
+                    
+                    # Switch back to Code Tab
+                    if code_tab_handle:
+                        driver.switch_to.window(code_tab_handle)
+                        # Refresh again to see new email? Usually good practice
                         driver.refresh()
-                        if logger: logger("刷新接码页面(3s间隔)...")
-                        WebDriverWait(driver, 5).until(lambda d: d.execute_script("return document.readyState") in ("interactive", "complete"))
-                    except Exception:
-                        pass
-                time.sleep(1)
-        
-        try:
-            if len(driver.window_handles) > 1:
-                driver.close()
-        except Exception:
-            pass
-        try:
-            driver.switch_to.window(main_handle)
-        except Exception:
-            pass
-        return code
+                    
+                except Exception as e:
+                    if logger: logger(f"重发流程异常: {e}")
+                    # Try to recover focus to code tab
+                    try:
+                        if code_tab_handle: driver.switch_to.window(code_tab_handle)
+                    except: pass
+            else:
+                if logger: logger("已达到最大重试次数，放弃")
+
     except Exception as e:
-        if logger:
-            logger(f"接码流程异常: {e}")
+        if logger: logger(f"接码流程严重异常: {e}")
+    finally:
+        # Ensure we close the code tab and return to main
         try:
-            if len(driver.window_handles) > 1:
+            current = driver.current_window_handle
+            if current != main_handle:
                 driver.close()
-        except Exception:
-            pass
-        try:
             driver.switch_to.window(main_handle)
         except Exception:
-            pass
-        return None
+            try:
+                driver.switch_to.window(main_handle)
+            except: pass
+            
+    return None
 
 
 def get_verification_code(driver: webdriver.Remote, code_url: str, code_xpath: Optional[str] = None, retries: int = 3, wait_seconds: int = 5, logger: Optional[Any] = None) -> Optional[str]:
@@ -1292,6 +1342,142 @@ def log_response_bodies(driver: webdriver.Remote, logger: Optional[Any], limit: 
         pass
 
 
+def extract_verification_code_unified(driver: webdriver.Remote, email_addr: str, password: str, resend_xpath: Optional[str], logger: Optional[Any], timeout: int = 400, proxy_config: Optional[Dict[str, Any]] = None, stop_event: Optional[threading.Event] = None) -> Optional[str]:
+    """
+    Unified verification code extraction using src.captcha_receiver and UI interaction (Resend Code).
+    Optimized to reuse IMAP connection.
+    """
+    if logger:
+        logger(f"Unified Captcha: Start (Email: {email_addr})")
+        if proxy_config:
+            logger(f"Unified Captcha: Using Proxy {proxy_config.get('addr')}:{proxy_config.get('port')}")
+
+    start_time = time.time()
+    max_retries = 4 # As per new requirement or consistent with previous
+    
+    # Ensure we are on the right window
+    main_handle = driver.current_window_handle
+
+    # Initialize MailExtractor once
+    extractor = None
+    
+    # NOTE: JieMa reference implementation does not use proxy for IMAP. 
+    # To ensure high success rate and avoid proxy issues with IMAP ports (993),
+    # we explicitly disable proxy for MailExtractor unless forced via env var.
+    use_imap_proxy = os.getenv("USE_IMAP_PROXY", "false").lower() == "true"
+    imap_proxy = proxy_config if use_imap_proxy else None
+    
+    if logger and not use_imap_proxy and proxy_config:
+        logger("Unified Captcha: IMAP Proxy disabled to match reference implementation (JieMa)")
+
+    try:
+        extractor = MailExtractor(email_addr, password, proxy_config=imap_proxy, logger=logger)
+    except Exception as e:
+        if logger: logger(f"Unified Captcha: ❌ 初始化邮箱连接失败: {e}")
+        return None
+
+    try:
+        for attempt in range(max_retries):
+            if stop_event and stop_event.is_set():
+                if logger: logger("Unified Captcha: Stopped by user")
+                return None
+
+            if time.time() - start_time > timeout:
+                if logger: logger("Unified Captcha: Timeout")
+                break
+                
+            if logger: logger(f"=== 接码轮次 {attempt+1}/{max_retries} ===")
+            if logger: logger(f"步骤: 正在读取邮箱 {email_addr} 获取验证码...")
+            
+            # Call backend to get captcha
+            # Reuse the existing extractor instance
+            poll_timeout = 15 
+            t_poll_start = time.time()
+            code = None
+            
+            # Inner poll loop
+            check_count = 0
+            while time.time() - t_poll_start < poll_timeout:
+                if stop_event and stop_event.is_set():
+                    return None
+                check_count += 1
+                try:
+                    # Ensure extractor is alive
+                    if not extractor:
+                         if logger: logger("Unified Captcha: Re-initializing MailExtractor...")
+                         extractor = MailExtractor(email_addr, password, proxy_config=imap_proxy, logger=logger)
+
+                    if logger: logger(f"Unified Captcha: 第 {check_count} 次检查邮箱...")
+                    code = extractor.get_latest_verification_code()
+                    if code:
+                        break
+                except Exception as e:
+                    if logger: logger(f"Unified Captcha: ⚠️ 邮箱检查异常: {e}")
+                    # Try to reconnect if needed
+                    try:
+                        if extractor:
+                            try:
+                                if hasattr(extractor, 'close'): extractor.close()
+                                elif hasattr(extractor, 'logout'): extractor.logout()
+                            except:
+                                pass
+                        extractor = None # Force re-init next loop
+                    except:
+                        pass
+                    time.sleep(1)
+                time.sleep(3)
+
+            if code and code not in ["未匹配到验证码", "未找到邮件"] and not code.startswith("错误:"):
+                if logger: logger(f"Unified Captcha: ✅ 成功获取验证码: {code}")
+                return code
+            else:
+                if logger: logger(f"Unified Captcha: ❌ 本轮未检测到验证码 (code={code})")
+                
+            # If not found, try Resend
+            if attempt < max_retries - 1:
+                if logger: logger("Unified Captcha: 尝试点击重发按钮 (Resend Code)...")
+                try:
+                    # Ensure focus
+                    try:
+                        driver.switch_to.window(main_handle)
+                        driver.switch_to.default_content() # Ensure we are not in an iframe
+                    except Exception:
+                        pass
+                        
+                    resend_xp = resend_xpath or "//a[contains(text(), 'Resend Code')]"
+                    
+                    # Check visibility
+                    if element_visible(driver, resend_xp, 3000, 1000):
+                        if js_click_xpath(driver, resend_xp):
+                            if logger: logger("Unified Captcha: ✅ 已点击重发按钮")
+                        else:
+                            # Fallback click
+                            el = driver.find_element(By.XPATH, resend_xp)
+                            el.click()
+                            if logger: logger("Unified Captcha: ✅ 已点击重发按钮 (原生)")
+                        
+                        if logger: logger("Unified Captcha: 等待邮件发送 (5s)...")
+                        time.sleep(5) # Wait for email delivery
+                    else:
+                        if logger: logger(f"Unified Captcha: ⚠️ 重发按钮不可见: {resend_xp}，可能还在冷却中")
+                        # Still wait a bit before next check
+                        time.sleep(3)
+                except Exception as e:
+                    if logger: logger(f"Unified Captcha: ⚠️ 重发操作异常: {e}")
+                    
+    finally:
+        if extractor:
+            try:
+                if hasattr(extractor, 'close'):
+                    extractor.close()
+                elif hasattr(extractor, 'logout'):
+                    extractor.logout()
+            except Exception:
+                pass
+
+    if logger: logger("Unified Captcha: ❌ 达到最大重试次数，接码失败")
+    return None
+
 def perform_registration(
     row: Dict[str, Any],
     xpaths: Dict[str, str],
@@ -1302,12 +1488,32 @@ def perform_registration(
     logger: Optional[Any] = None,
     stop_event: Optional[threading.Event] = None,
     target_check: Optional[Callable[[], bool]] = None,
-    silent_mode: bool = False,
+    headless_mode: bool = False,
     udp_enabled: bool = False,
-    email_manager: Optional[Any] = None,
+    email_pool: Optional[EmailPool] = None,
     keep_open_on_failure_ms: int = 0,
     allow_hold_on_early_failure: bool = False,
+    events: Optional[RegistrationEvents] = None,
 ) -> Tuple[bool, str]:
+    _logger_orig = logger
+    def _log(msg: str, **kwargs):
+        # Support level kwarg but ignore it for now or format it
+        level = kwargs.get('level', '').upper()
+        full_msg = f"[{level}] {msg}" if level else msg
+        
+        if _logger_orig:
+            # Check if original logger supports kwargs, otherwise just send msg
+            try:
+                _logger_orig(full_msg)
+            except TypeError:
+                _logger_orig(full_msg) # Fallback
+                
+        if events and events.on_log:
+            events.on_log(full_msg)
+    logger = _log
+    
+    log_memory_usage(logger)
+
     email = str(row.get('email') or row.get('账号') or '').strip()
     password = str(row.get('password') or row.get('密码') or '').strip()
     code_url = str(row.get('code_url') or row.get('接收验证码链接') or '').strip()
@@ -1318,6 +1524,27 @@ def perform_registration(
     protocol = str(row.get('protocol') or row.get('proxyType') or 'socks5').strip()
     window_name = str(row.get('windowName') or row.get('窗口名称') or email or 'win').strip()
     
+    # Construct proxy_config for IMAP connectivity (SOCKS/HTTP)
+    proxy_config = None
+    if host and port:
+        try:
+            ptype = socks.SOCKS5
+            if protocol.lower() == 'http':
+                ptype = socks.HTTP
+            elif protocol.lower() == 'socks4':
+                ptype = socks.SOCKS4
+            
+            proxy_config = {
+                'proxy_type': ptype,
+                'addr': host,
+                'port': int(port),
+                'username': proxy_username if proxy_username else None,
+                'password': proxy_password if proxy_password else None,
+                'rdns': True
+            }
+        except Exception as e:
+            if logger: logger(f"代理配置解析失败: {e}")
+            
     # Resolve dynamic settings if they are callables
     current_timeout = timeout_ms() if callable(timeout_ms) else timeout_ms
     current_poll = poll_ms() if callable(poll_ms) else poll_ms
@@ -1336,12 +1563,16 @@ def perform_registration(
     browser_id = None
     driver = None
     result_ok = False
+    
+    # Optimization: Disable QUIC to prevent UDP timeouts on proxies (common cause of page load hangs)
+    browser_cmd_args = ["--disable-quic"]
+    
     try:
-        browser_id = client.update_browser(window_name, proxy_payload(host, port, proxy_username, proxy_password, protocol))
+        browser_id = client.update_browser(window_name, proxy_payload(host, port, proxy_username, proxy_password, protocol), enable_udp=udp_enabled, cmd_args=browser_cmd_args)
     except Exception:
         # 如果更新失败（如不存在），尝试创建
         try:
-            browser_id = client.create_browser(window_name, proxy_payload(host, port, proxy_username, proxy_password, protocol))
+            browser_id = client.create_browser(window_name, proxy_payload(host, port, proxy_username, proxy_password, protocol), enable_udp=udp_enabled, cmd_args=browser_cmd_args)
         except Exception as create_err:
             if logger:
                 logger(f"创建窗口失败: {create_err}")
@@ -1368,8 +1599,8 @@ def perform_registration(
     gate_state = 'attached'
     debug_tab_opened = False
     
-    # Silent Mode: Move window off-screen instead of minimize for stability
-    if silent_mode:
+    # Headless Mode: Move window off-screen instead of minimize for stability
+    if headless_mode:
         try:
             driver.set_window_position(-3000, 0)
         except Exception:
@@ -1382,26 +1613,27 @@ def perform_registration(
     try:
         if logger:
             logger("步骤: 打开平台网址")
-        if not check_connectivity(driver, platform_url, logger, max_wait=20):
+        if not check_connectivity(driver, platform_url, logger, max_wait=45):
             take_screenshot(driver, f"{window_name}_connectivity_failed.png", logger)
             return False, 'proxy_connectivity_failed'
         # 页面就绪与加载时间
-        wait_page_ready(driver, 20)
+        wait_page_ready(driver, 45)
         log_page_timing(driver, logger)
         log_resource_status(driver, logger)
         # DOM 可见性校验，确保关键入口元素已渲染
+        # 针对代理网络不稳定的情况，将超时时间从 10s 增加到 30s，并优化重试逻辑
         try:
-            if not element_visible(driver, xpaths.get('language_menu', ''), min(current_timeout, 10000), current_poll):
+            if not element_visible(driver, xpaths.get('language_menu', ''), min(current_timeout, 30000), current_poll):
                 if logger:
-                    logger("DOM状态校验失败: language_menu 未可见，尝试刷新后重试")
+                    logger("DOM状态校验失败: language_menu 未可见 (30s)，尝试刷新后重试")
                 try:
                     driver.refresh()
                 except Exception:
                     pass
-                wait_page_ready(driver, 20)
+                wait_page_ready(driver, 45) # 增加页面就绪等待时间
                 log_page_timing(driver, logger)
                 log_resource_status(driver, logger)
-                if not element_visible(driver, xpaths.get('language_menu', ''), min(current_timeout, 10000), current_poll):
+                if not element_visible(driver, xpaths.get('language_menu', ''), min(current_timeout, 30000), current_poll):
                     if logger:
                         logger("DOM状态校验仍失败: language_menu 未可见，继续后续入口以免阻塞")
         except Exception:
@@ -1591,8 +1823,8 @@ def perform_registration(
                 body_text = driver.find_element(By.TAG_NAME, 'body').text.lower()
                 if "already registered" in body_text or "already used" in body_text or "account exists" in body_text:
                     if logger: logger("检测到邮箱已被使用提示")
-                    if email_manager:
-                        email_manager.update_email_status(email, 'fail_used')
+                    if email_pool:
+                        email_pool.update_email_status(email, 'fail_used')
                     return False, 'email_used_prompt'
         except Exception:
             pass
@@ -1642,6 +1874,11 @@ def perform_registration(
                 log_resource_phase_timings(driver, logger, contains="captcha", limit=30)
             except Exception:
                 pass
+        
+        # 强制等待5秒，防止滑块刚过就去接码，导致接到旧验证码
+        if logger: logger("步骤: 滑块通过，强制等待 5 秒...")
+        time.sleep(5)
+
         # 优化: 滑块通过后，直接跳转接码页等待验证码
         if logger:
             logger("步骤: 滑块通过，立即跳转接码页等待验证码")
@@ -1654,7 +1891,44 @@ def perform_registration(
             return False, 'target_reached'
 
         # 直接调用接码流程 (内部负责打开、刷新、提取)
-        code = extract_verification_code_flow(driver, code_url, xpaths.get('code_input'), logger, open_data.get('http'), timeout=60)
+        # Multilingual Resend XPath fallback
+        default_resend_xp = "//a[contains(text(), 'Resend Code') or contains(text(), '重新发送') or contains(text(), '再发一条')]"
+        resend_xp = xpaths.get('resend_code') or default_resend_xp
+        
+        # Unified Captcha Flow
+        # Use auth_code if available (for IMAP), otherwise password
+        # Support 'code_url' as legacy alias (due to previous gui_ctk mismatch)
+        auth_code_val = row.get('auth_code') or row.get('授权码') or row.get('authCode') or row.get('code_url')
+        pwd_val = row.get('password') or row.get('密码')
+        
+        password_for_imap = str(auth_code_val or pwd_val or '').strip()
+        
+        if logger:
+            # Mask credentials for safety
+            masked_auth = f"{str(auth_code_val)[:2]}...{str(auth_code_val)[-2:]}" if auth_code_val and len(str(auth_code_val)) > 4 else "None/Short"
+            masked_pwd = f"{str(pwd_val)[:2]}...{str(pwd_val)[-2:]}" if pwd_val and len(str(pwd_val)) > 4 else "None/Short"
+            used_cred_type = "AuthCode" if auth_code_val else "Password"
+            logger(f"Unified Captcha: Credential Check - AuthCode: {bool(auth_code_val)} ({masked_auth}), Password: {bool(pwd_val)} ({masked_pwd}), Using: {used_cred_type}")
+            
+        if not password_for_imap:
+             if logger: logger("❌ 错误: 缺少密码/授权码，无法获取验证码。")
+             return False, 'missing_credentials'
+
+        if logger: logger("使用 Unified Captcha 模式获取验证码...")
+        # 额外防呆: 163/126/QQ 邮箱若使用密码而非授权码，IMAP登录极大概率失败
+        try:
+            domain = (email.split('@')[-1] or '').lower()
+            # 简单判断: 如果是网易/QQ系且没有单独提供 auth_code (即 auth_code_val 为空)，则发出警告
+            if domain in ('163.com', '126.com', 'qq.com'):
+                if not auth_code_val:
+                     if logger:
+                        logger(f"⚠️ 风险提示: {domain} 邮箱通常需要独立的授权码(AuthCode)才能登录IMAP，当前仅检测到密码(Password)。", level="warning")
+                elif auth_code_val == pwd_val:
+                     if logger:
+                        logger(f"⚠️ 风险提示: {domain} 邮箱的授权码与密码相同。请确认您使用的是IMAP专用授权码，而非网页登录密码。", level="warning")
+        except Exception:
+            pass
+        code = extract_verification_code_unified(driver, email, password_for_imap, resend_xp, logger, timeout=400, proxy_config=proxy_config, stop_event=stop_event)
         
         if not code:
             if logger:
@@ -1673,45 +1947,90 @@ def perform_registration(
         if logger:
             logger("步骤: 获取验证码成功，已切回主窗口")
 
+        # Switch to default content to ensure we are not stuck in an iframe
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
+
         # 3. 拿到验证码后，等待输入框出现并填入
         try:
             t0 = time.time()
             if logger: logger("正在等待验证码输入框...")
-            # 因为之前已经等待了验证码提取时间，这里通常应该已经就绪，但为了稳健仍给予等待
-            WebDriverWait(driver, 10).until(
-                EC.visibility_of_element_located((By.XPATH, code_input_el_xpath))
-            )
-            if logger: logger(f"验证码输入框就绪 (耗时 {time.time()-t0:.2f}s)")
+            
+            # Use multiple locators for robustness
+            input_locators = [
+                code_input_el_xpath,
+                "//input[@autocomplete='one-time-code']",
+                "//input[contains(@placeholder, 'verification') or contains(@placeholder, 'code') or contains(@placeholder, '验证码')]",
+                "//input[@type='text' and string-length(@maxlength)='6']"
+            ]
+            # Filter None/Empty and unique
+            input_locators = list(dict.fromkeys([x for x in input_locators if x]))
+            
+            found_input_xpath = None
+            for xp in input_locators:
+                 try:
+                     if element_visible(driver, xp, 1000, current_poll):
+                         found_input_xpath = xp
+                         break
+                 except:
+                     pass
+            
+            if not found_input_xpath:
+                # Retry finding any valid input for a short period
+                end_find = time.time() + 10
+                while time.time() < end_find:
+                    for xp in input_locators:
+                        try:
+                            if element_visible(driver, xp, 500, current_poll):
+                                found_input_xpath = xp
+                                break
+                        except:
+                            pass
+                    if found_input_xpath:
+                        break
+                    time.sleep(1)
+
+            if not found_input_xpath:
+                if logger: logger("验证码输入框未出现(超时)")
+                # 再次诊断
+                try:
+                    body_text = driver.find_element(By.TAG_NAME, 'body').text
+                    if "frequent" in body_text.lower() or "try again" in body_text.lower():
+                         if logger: logger(f"诊断: 页面包含错误提示")
+                except Exception:
+                    pass
+                return False, 'code_input_not_visible'
+
+            if logger: logger(f"验证码输入框就绪: {found_input_xpath} (耗时 {time.time()-t0:.2f}s)")
+            
+            # Fill the code
+            el = driver.find_element(By.XPATH, found_input_xpath)
+            el.clear()
+            el.send_keys(code)
+            
         except Exception:
-            if logger: logger("验证码输入框未出现(超时)")
-            # 再次诊断
-            try:
-                body_text = driver.find_element(By.TAG_NAME, 'body').text
-                if "frequent" in body_text.lower() or "try again" in body_text.lower():
-                     if logger: logger(f"诊断: 页面包含错误提示")
-            except Exception:
-                pass
-            return False, 'code_input_not_visible'
+            if logger: logger("验证码填写异常")
+            return False, 'code_input_error'
         
-        # 3. Input code
+        # 3. Input code (Legacy block removed as we did it above)
         if target_check and target_check():
             if logger: logger("终止提交：已达到目标注册数量")
             return False, 'target_reached'
-        WebDriverWait(driver, min(current_timeout, 10000) / 1000.0).until(
-            EC.visibility_of_element_located((By.XPATH, code_input_el_xpath))
-        ).send_keys(code)
+            
         if logger:
             logger("步骤: 填写验证码")
         
-        # Secondary email check before final submit
-        if email_manager and email_manager.is_email_registered(email):
-             if logger: logger(f"提交前检测: 邮箱 {email} 已被注册")
-             return False, 'email_already_registered_secondary'
-
         if target_check and target_check():
             if logger: logger("终止提交：已达到目标注册数量")
             return False, 'target_reached'
         find_click_any(driver, xpaths['final_submit_btn'], current_timeout, current_poll)
+        
+        # 强制等待 1 秒，防止提交过快
+        if logger: logger("提交后强制等待 1 秒...")
+        time.sleep(1)
+
         try:
             log_performance_network(driver, logger, 100, domain_filter=None)
         except Exception:
@@ -1736,8 +2055,30 @@ def perform_registration(
         # Filter None
         popup_xpaths = [x for x in popup_xpaths if x]
         
-        for attempt in range(3):
+        for attempt in range(5):
             try:
+                # 优先检查是否已经注册成功（通过URL或Toast）
+                try:
+                    curr_url = driver.current_url
+                    if "all-tools" in curr_url or "dashboard" in curr_url:
+                        if logger: logger("检测到 URL 跳转至后台，视为注册成功")
+                        popup_closed = True
+                        break
+                    
+                    # 检查 'You have signed in' 提示
+                    if element_visible(driver, "//*[contains(text(), 'You have signed in')]", 500, current_poll):
+                         if logger: logger("检测到 'You have signed in' 提示，视为注册成功")
+                         popup_closed = True
+                         break
+                    
+                    # 检查 'Sign In' 或 'Login' (注册成功后跳转登录页 - User Issue: Stuck on login page)
+                    if element_visible(driver, "//*[contains(text(), 'Sign In') or contains(text(), 'Login') or contains(text(), '登录')]", 500, current_poll):
+                         if logger: logger("检测到登录页面元素(Sign In)，视为注册成功")
+                         popup_closed = True
+                         break
+                except Exception:
+                    pass
+
                 if logger and attempt == 0: logger("检查关闭弹窗状态...")
                 
                 # Check if popup exists AND is visible
@@ -1794,9 +2135,9 @@ def perform_registration(
         
         if popup_closed:
              # Strict Email Status Update: Only mark as submitted AFTER successful popup close
-            if email_manager:
+            if email_pool:
                 try:
-                    email_manager.update_email_status(email, 'submitted')
+                    email_pool.update_email_status(email, 'submitted')
                     if logger: logger(f"邮箱 {email} 已标记为 submitted (注册流程完成)")
                 except Exception as e:
                     if logger: logger(f"标记邮箱状态失败: {e}")
@@ -1809,9 +2150,9 @@ def perform_registration(
             # 即使未找到弹窗，也标记为成功，因为"final_submit_btn"已经点击
             # User Request: "Correct to: Fill Email -> Click Submit -> Mark on Success"
             # Since we treat "Submit Clicked" as Success (even if popup fails), we mark it here.
-            if email_manager:
+            if email_pool:
                 try:
-                    email_manager.update_email_status(email, 'submitted')
+                    email_pool.update_email_status(email, 'submitted')
                     if logger: logger(f"邮箱 {email} 已标记为 submitted (强制成功)")
                 except Exception as e:
                     if logger: logger(f"标记邮箱状态失败: {e}")
@@ -1823,49 +2164,22 @@ def perform_registration(
         return False, str(e)
     finally:
         # Rollback Mechanism: If not successful, reset email status if needed
-        if not result_ok and email_manager:
+        if not result_ok and email_pool:
             try:
-                # If failure, and we haven't determined it's a permanent failure (like email used), reset.
-                # If msg is 'email_used_prompt' or 'email_already_registered', we should NOT reset.
-                # result_ok is False here.
-                # But 'msg' variable is local to try block? No, it's not in scope of finally if exception raised before definition.
-                # We can check the actual status in email_manager.
-                
-                # However, perform_registration doesn't update 'fail_used' itself usually, it returns msg.
-                # The caller (run_batch) handles status updates based on return value.
-                # EXCEPT for the 'submitted' status we just added inside the function.
-                
-                # So if we marked 'submitted' but then crashed/failed (unlikely given the flow above), we should rollback.
-                # Or if we marked nothing, we ensure it's clean.
-                
-                # Check if email is currently marked as 'submitted' or 'success' but we are failing?
-                # If we are failing, we shouldn't have marked it 'submitted' yet, unless exception occurred AFTER marking.
-                
-                # But the user request says: "If registration flow fails at ANY stage, auto reset email status to unused".
-                # This implies if it was 'new' and we failed, keep it 'new'.
-                # If we marked it 'used' prematurely, reset it.
-                # Since we strictly moved marking to the end, the only risk is if we marked it and then failed in finally block?
-                # Or if previous steps marked it? (Previous steps don't mark it).
-                
-                # So this is mostly a safety net.
-                pass
-            except Exception:
-                pass
+                # Update status to 'failed' so it can be distinguished from 'new'
+                # Use a specific failure reason if available in future, but 'failed' is good for now
+                email_pool.update_email_status(email, 'failed')
+                if logger: logger(f"邮箱 {email} 已标记为 failed (注册未完成)")
+            except Exception as e:
+                if logger: logger(f"重置邮箱状态失败: {e}")
 
         if logger:
              logger(f"正在清理资源: {browser_id}")
         
-        # 诊断: 检查窗口是否在清理前仍然存活
-        try:
-            if browser_id and logger:
-                detail = client.detail_browser(browser_id)
-                logger(f"清理前浏览器状态: {detail}")
-        except Exception:
-            pass
-
         elapsed = time.time() - t_attached if 't_attached' in locals() else 0
         early_failure = (not result_ok) and (gate_state in ('attached', 'pre_open_more_tools', 'tab_switched'))
-        hold_close = (not result_ok) and ((elapsed < (keep_open_on_failure_ms / 1000.0)) or (allow_hold_on_early_failure and early_failure))
+        is_stopped = stop_event and stop_event.is_set()
+        hold_close = (not result_ok) and (not is_stopped) and ((elapsed < (keep_open_on_failure_ms / 1000.0)) or (allow_hold_on_early_failure and early_failure))
         if hold_close and logger:
             if allow_hold_on_early_failure and early_failure:
                 logger("因早期失败，保持窗口并等待后续重试")
@@ -1873,14 +2187,24 @@ def perform_registration(
                 logger(f"因失败且未达到最小保持时间({keep_open_on_failure_ms}ms)，暂不关闭窗口")
         
         # 优先使用 driver.quit() 关闭窗口，这通常比 API 更干净
+        # 优化: 使用线程超时机制防止 driver.quit() 卡死 (User Issue: Window stays open)
         try:
             if driver and not hold_close:
-                # 检查连接是否还在，如果还在则退出
-                try:
-                    driver.quit()
-                    if logger: logger("driver.quit() 执行完成")
-                except Exception:
-                    pass
+                def _quit_driver():
+                    try:
+                        driver.quit()
+                    except:
+                        pass
+                
+                t_quit = threading.Thread(target=_quit_driver)
+                t_quit.start()
+                t_quit.join(timeout=3.0) # 最多等待3秒
+                
+                if t_quit.is_alive():
+                     if logger: logger("driver.quit() 超时，跳过并直接调用API关闭")
+                elif logger:
+                     logger("driver.quit() 执行完成")
+
         except Exception as e:
             if logger: logger(f"driver.quit error: {e}")
 
@@ -1889,8 +2213,12 @@ def perform_registration(
                 if result_ok:
                     if logger: logger("注册成功，等待数据同步...")
                     time.sleep(3)
-                client.close_browser(browser_id)
-                if logger: logger(f"已请求关闭浏览器API: {browser_id}")
+                # 无论 driver.quit 是否成功，都尝试调用 close_browser
+                try:
+                    client.close_browser(browser_id)
+                    if logger: logger(f"已请求关闭浏览器API: {browser_id}")
+                except Exception as close_err:
+                    if logger: logger(f"close_browser warning: {close_err}")
         except Exception as e:
             if logger: logger(f"close_browser error: {e}")
 
@@ -1926,9 +2254,10 @@ def run_batch(
     ip_manager: Optional[Any] = None,
     exhaustion_cb: Optional[Any] = None,
     target_success_count: int = 99999999,
-    email_manager: Optional[Any] = None,
-    silent_mode: bool = False,
+    email_pool: Optional[EmailPool] = None,
+    headless_mode: bool = False,
     udp_enabled: bool = False,
+    events: Optional[RegistrationEvents] = None,
 ) -> None:
     rows = read_rows(input_path)
     if not rows:
@@ -2004,27 +2333,32 @@ def run_batch(
         
         email = str(r.get('email') or r.get('账号') or '').strip()
         
-        # Check if email is already used in EmailManager (source of truth)
-        if email_manager and email_manager.is_email_registered(email):
-             if logger: logger(f"跳过 {email}: 邮箱状态已标记为已使用/成功")
-             r['status'] = 'surplus' 
-             return idx, False, 'email_already_used_persistent'
+        # Pre-Registration Check (Duplicate/Validation)
+        if email_pool:
+            is_avail, reason = email_pool.check_email_availability(email)
+            if not is_avail:
+                 if logger: logger(f"跳过 {email}: 邮箱不可用 ({reason})")
+                 r['status'] = 'surplus' if 'local_status' in reason else 'bad'
+                 return idx, False, f'email_unavailable_{reason}'
+        
+        # Legacy check (just in case email_manager is old version, though we just updated it)
+        # if email_manager and email_manager.is_email_registered(email): ...
         
         # Mark as processing
-        if email_manager:
-            email_manager.update_email_status(email, 'processing')
+        if email_pool:
+            email_pool.update_email_status(email, 'processing')
         
         # IP Allocation Logic
         if ip_manager:
             while True:
                 if stop_event and stop_event.is_set():
-                    if email_manager:
-                        email_manager.update_email_status(email, 'stopped')
+                    if email_pool:
+                        email_pool.update_email_status(email, 'stopped')
                     return idx, False, 'stopped'
                 with lock:
                     if global_success_count >= target_success_count:
-                        if email_manager:
-                            email_manager.update_email_status(email, 'skipped')
+                        if email_pool:
+                            email_pool.update_email_status(email, 'skipped')
                         return idx, False, 'target_reached'
                 
                 ip_entry, status = ip_manager.allocate_ip(email)
@@ -2041,8 +2375,8 @@ def run_batch(
                 elif status == 'email_used':
                     if logger:
                         logger(f"跳过 {email}: 此邮箱已在IP池中使用过")
-                    if email_manager:
-                        email_manager.update_email_status(email, 'skipped_ip_used')
+                    if email_pool:
+                        email_pool.update_email_status(email, 'skipped_ip_used')
                     return idx, False, 'email_already_used_in_pool'
                 elif status == 'ip_busy':
                     if logger:
@@ -2061,16 +2395,16 @@ def run_batch(
                         else:
                             if logger:
                                 logger("用户取消任务")
-                            if email_manager:
-                                email_manager.update_email_status(email, 'cancelled')
+                            if email_pool:
+                                email_pool.update_email_status(email, 'cancelled')
                             return idx, False, 'ip_exhausted_cancelled'
                     else:
-                        if email_manager:
-                            email_manager.update_email_status(email, 'failed_ip_exhausted')
+                        if email_pool:
+                            email_pool.update_email_status(email, 'failed_ip_exhausted')
                         return idx, False, 'ip_exhausted_no_handler'
                 else:
-                    if email_manager:
-                        email_manager.update_email_status(email, f'failed_ip_error_{status}')
+                    if email_pool:
+                        email_pool.update_email_status(email, f'failed_ip_error_{status}')
                     return idx, False, f'ip_allocation_error: {status}'
 
         try:
@@ -2089,13 +2423,16 @@ def run_batch(
                     logger,
                     stop_event,
                     target_check=lambda: global_success_count >= target_success_count,
-                    silent_mode=silent_mode,
+                    headless_mode=headless_mode,
                     udp_enabled=udp_enabled,
-                    email_manager=email_manager,
+                    email_pool=email_pool,
                     keep_open_on_failure_ms=0,
                     allow_hold_on_early_failure=False,
+                    events=events,
                 )
                 if not ok:
+                    if events and events.on_failure:
+                        events.on_failure(email, msg)
                     if logger:
                         logger(f"重试 {attempts}/3: {email} 失败原因: {msg}")
                     if msg and ('proxy' in msg or 'network' in msg):
@@ -2112,17 +2449,19 @@ def run_batch(
                      
             with lock:
                 if ok:
+                    if events and events.on_success:
+                        events.on_success(email)
                     global_success_count += 1
                     if global_success_count > target_success_count:
                         r['status'] = 'surplus'
                         msg = 'Excess registration (target exceeded)'
                         if logger: logger(f"⚠️ 超量注册检测: {email} (当前成功数: {global_success_count}, 目标: {target_success_count})")
-                        if email_manager:
-                            email_manager.update_email_status(email, 'surplus')
+                        if email_pool:
+                            email_pool.update_email_status(email, 'surplus')
                     else:
                         r['status'] = 'good'
-                        if email_manager:
-                            email_manager.update_email_status(email, 'success')
+                        if email_pool:
+                            email_pool.update_email_status(email, 'success')
 
                     if global_success_count >= target_success_count:
                         if not stop_event.is_set():
@@ -2130,19 +2469,32 @@ def run_batch(
                             if logger: logger(f"🛑 终止条件触发: 任务完成目标 ({target_success_count})，已触发停止信号")
                 else:
                     r['status'] = 'fail'
-                    if email_manager:
+                    if email_pool:
                         if msg == 'email_already_registered_local':
                             pass
                         elif msg == 'email_used_prompt':
-                            email_manager.update_email_status(email, 'fail_used')
+                            email_pool.update_email_status(email, 'fail_used')
                         else:
                             # User requested to reset to unused on failure
-                            email_manager.update_email_status(email, 'new')
+                            email_pool.update_email_status(email, 'new')
         finally:
-             if ip_manager and 'ip_entry' in locals() and ip_entry:
+            # Check if we need to release IP mapping if task failed
+            if ip_manager and 'ip_entry' in locals() and ip_entry:
+                 # If not successful, we should ensure the specific IP binding is released 
+                 # so it doesn't stay 'bound' to this email if the email is going back to 'new' state.
+                 # release_ip handles the logic of "unbinding" this email from this IP.
+                 if not ok:
+                     try:
+                         ip_manager.release_ip(ip_entry['host'], ip_entry['port'], email)
+                     except Exception:
+                         pass
+                 
+                 # Always release the active count
                  ip_manager.release_active_ip(ip_entry['host'], ip_entry['port'])
                 
-        row['msg'] = msg
+        r['msg'] = msg
+        if events and events.on_finish:
+            events.on_finish(email, ok, msg)
         return idx, ok, msg
 
     pending_idx = [i for i, r in enumerate(rows) if str(r.get('status', '')).strip() != 'good']

@@ -354,9 +354,9 @@ class IPManager:
                 used_count = len(ip.get("used_by", []))
                 
                 # Check if IP is active (concurrency control)
-                ip_key = (ip["host"], str(ip["port"]))
-                if ip_key in self.active_ips:
-                    continue
+                # ip_key = (ip["host"], str(ip["port"]))
+                # if ip_key in self.active_ips:
+                #     continue
 
                 if used_count < max_u:
                     candidate = ip

@@ -1,4 +1,6 @@
 import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import json
 import threading
 import queue
@@ -11,25 +13,75 @@ import csv
 import time
 import psutil
 import traceback
+import platform
 try:
-    import pystray
-    from PIL import Image, ImageDraw
-    HAS_PYSTRAY = True
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+    HAS_DND = True
 except ImportError:
-    HAS_PYSTRAY = False
+    HAS_DND = False
+
 from typing import Dict
 
-from register_kling_bitbrowser import run_batch, read_rows
-from ip_manager import IPManager
-from email_manager import EmailManager
+# Imports assuming run from root via "python -m src.gui_ctk"
+try:
+    from src.register_kling_bitbrowser import run_batch, read_rows
+    from src.ip_manager import IPManager
+    from src.email_pool import EmailPool
+    from src.health_server import start_health_server
+except ImportError:
+    # Fallback for direct execution (not recommended but handled)
+    from register_kling_bitbrowser import run_batch, read_rows
+    from ip_manager import IPManager
+    from email_pool import EmailPool
+    from health_server import start_health_server
 
-class App(ctk.CTk):
+# Dynamic inheritance for DnD support
+BaseClasses = [ctk.CTk]
+if HAS_DND:
+    BaseClasses.append(TkinterDnD.DnDWrapper)
+
+class App(*BaseClasses):
     def __init__(self):
         super().__init__()
+        # Start health server immediately
+        try:
+            start_health_server()
+        except Exception:
+            pass
+
+        if HAS_DND:
+            try:
+                self.TkdndVersion = TkinterDnD._require(self)
+            except Exception:
+                try:
+                    print("DnD 初始化失败，继续以无拖拽模式运行")
+                except Exception:
+                    pass
+        
+        # Start Health Server
+        start_health_server(9999)
+        
         self._main_thread_id = threading.get_ident()
         self._ui_queue: "queue.Queue[callable]" = queue.Queue()
         self._log_lock = threading.Lock()
-        self._log_file_path = None
+        
+        # Determine paths
+        if getattr(sys, 'frozen', False):
+            self.base_dir = os.path.dirname(__file__)
+            self.exe_dir = os.path.dirname(sys.executable)
+            self.project_root = self.exe_dir # In frozen app, root is exe dir
+        else:
+            self.base_dir = os.path.dirname(os.path.abspath(__file__)) # src/
+            self.project_root = os.path.dirname(self.base_dir) # root/
+            self.exe_dir = self.project_root # For compatibility
+            
+        self._log_file_path = os.path.join(self.project_root, 'logs', 'app.log')
+        self._perf_file_path = os.path.join(self.project_root, 'logs', 'perf.log')
+        
+        # Ensure logs dir exists
+        os.makedirs(os.path.dirname(self._log_file_path), exist_ok=True)
+        
+        self._perf_lock = threading.Lock()
         self._log_max_lines = 2000
         self._last_worker_heartbeat = 0.0
         self._last_ui_heartbeat = time.time()
@@ -38,24 +90,24 @@ class App(ctk.CTk):
         ctk.set_appearance_mode('dark')
         ctk.set_default_color_theme('blue')
         self.attributes('-topmost', False)
-        if getattr(sys, 'frozen', False):
-            self.base_dir = os.path.dirname(__file__)
-            self.exe_dir = os.path.dirname(sys.executable)
-        else:
-            self.base_dir = os.path.dirname(__file__)
-            self.exe_dir = self.base_dir
-        self._log_file_path = os.path.join(self.exe_dir, 'app.log')
-        self._perf_file_path = os.path.join(self.exe_dir, 'perf.log')
-        self._perf_lock = threading.Lock()
-        
+
         # Initialize Managers
-        self.ip_manager = IPManager(os.path.join(self.exe_dir, 'ip_pool.json'))
+        # State files in logs/ or config/? EmailManager uses it as status DB.
+        self.ip_manager = IPManager(os.path.join(self.project_root, 'config', 'ip_pool.json')) # Input pool
         self.ip_manager.set_logger(self.append_log)
-        self.email_manager = EmailManager(os.path.join(self.exe_dir, 'email_pool.json'))
+        
+        # EmailPool stores config in config/email_pool.csv
+        self.email_pool = EmailPool(os.path.join(self.project_root, 'config', 'email_pool.csv'))
+        
+        # Register Listeners for Real-time Updates
+        # Update Email List UI when pool changes
+        self.email_pool.add_listener(lambda: self._run_on_ui(self._update_email_list_ui))
+        # Update Stats when pool changes
+        self.email_pool.add_listener(lambda: self._run_on_ui(self.trigger_refresh))
         
         # Set Callbacks for Real-time Updates
         self.ip_manager.set_on_status_change_callback(lambda: self._run_on_ui(self.trigger_refresh))
-        self.email_manager.set_on_status_change_callback(lambda: self._run_on_ui(self.trigger_refresh))
+        # self.email_manager.set_on_status_change_callback(lambda: self._run_on_ui(self.trigger_refresh))
         
         # Performance Monitoring & Debounce
         self.last_refresh_time = 0
@@ -67,14 +119,13 @@ class App(ctk.CTk):
         self.refresh_stats_perf = [] # Store last 10 refresh durations
 
         # Use exe_dir for config/user files, base_dir for bundled resources
-        self.csv_var = tkinter.StringVar(value=os.path.join(self.exe_dir, 'kl-mail.csv'))
-        if not os.path.exists(self.csv_var.get()):
-             self.csv_var.set(os.path.join(self.base_dir, 'kl-mail.csv'))
+        # Default input CSV in config/email_pool.csv
+        default_csv = os.path.join(self.project_root, 'config', 'email_pool.csv')
+        self.csv_var = tkinter.StringVar(value=default_csv)
 
-
-        self.xpath_var = tkinter.StringVar(value=os.path.join(self.exe_dir, 'kling_xpaths.json'))
-        if not os.path.exists(self.xpath_var.get()):
-             self.xpath_var.set(os.path.join(self.base_dir, 'kling_xpaths.json'))
+        # XPaths in config/kling_xpaths.json
+        default_xpath = os.path.join(self.project_root, 'config', 'kling_xpaths.json')
+        self.xpath_var = tkinter.StringVar(value=default_xpath)
 
         self.bit_url_var = tkinter.StringVar(value='http://127.0.0.1:54345')
         self.bit_secret_var = tkinter.StringVar(value=os.environ.get('BITBROWSER_SECRET') or '')
@@ -87,12 +138,10 @@ class App(ctk.CTk):
         self.cnt_total_var = tkinter.StringVar(value='0')
         self.cnt_success_var = tkinter.StringVar(value='0')
         self.cnt_fail_var = tkinter.StringVar(value='0')
-        self.silent_mode_var = tkinter.BooleanVar(value=False)
-        self.minimize_to_tray_var = tkinter.BooleanVar(value=False)
+        self.headless_mode_var = tkinter.BooleanVar(value=False)
         self.udp_var = tkinter.BooleanVar(value=False)
         self.stop_event = threading.Event()
         self.worker = None
-        self.tray_icon = None
         
         # Override Close Event
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -416,12 +465,8 @@ class App(ctk.CTk):
         # 4. Run Mode
         def create_run_mode(p):
             f = ctk.CTkFrame(p, fg_color="transparent")
-            ctk.CTkCheckBox(f, text="静默模式", variable=self.silent_mode_var, width=80).pack(side='left', padx=2)
+            ctk.CTkCheckBox(f, text="无头模式 (Headless)", variable=self.headless_mode_var, width=120).pack(side='left', padx=2)
             ctk.CTkCheckBox(f, text="启用UDP", variable=self.udp_var, width=80).pack(side='left', padx=2)
-            if HAS_PYSTRAY:
-                ctk.CTkCheckBox(f, text="最小化托盘", variable=self.minimize_to_tray_var, width=100).pack(side='left', padx=2)
-            else:
-                 ctk.CTkLabel(f, text="(需安装pystray)", text_color="gray", font=("Arial", 10)).pack(side='left')
             return f
         add_config_row(grid_frame, 3, 1, "运行模式:", create_run_mode)
 
@@ -867,7 +912,7 @@ class App(ctk.CTk):
         
         ctk.CTkButton(tool_frame, text="导入账号 (TXT/CSV)", command=self.import_emails_dialog).pack(side='left', padx=6)
         ctk.CTkButton(tool_frame, text="粘贴导入 (自动生成URL)", command=self.paste_import_emails_dialog).pack(side='left', padx=6)
-        ctk.CTkButton(tool_frame, text="导出为注册任务CSV", command=self.export_emails_to_csv).pack(side='left', padx=6)
+        # ctk.CTkButton(tool_frame, text="导出为注册任务CSV", command=self.export_emails_to_csv).pack(side='left', padx=6) # Removed
         # Restore Refresh Button as 'Refresh View' (Does not change state)
         ctk.CTkButton(tool_frame, text="刷新视图", command=self.refresh_email_view_only).pack(side='left', padx=6)
         
@@ -896,16 +941,16 @@ class App(ctk.CTk):
         # Treeview for Emails
         from tkinter import ttk
         
-        columns = ("email", "password", "code_url", "status")
+        columns = ("email", "password", "auth_code", "status")
         self.email_tree = ttk.Treeview(list_frame, columns=columns, show="headings", selectmode="extended")
         self.email_tree.heading("email", text="邮箱账号")
         self.email_tree.heading("password", text="密码")
-        self.email_tree.heading("code_url", text="验证码接收地址")
+        self.email_tree.heading("auth_code", text="授权码")
         self.email_tree.heading("status", text="使用状态")
         
         self.email_tree.column("email", width=200)
         self.email_tree.column("password", width=120)
-        self.email_tree.column("code_url", width=300)
+        self.email_tree.column("auth_code", width=300)
         self.email_tree.column("status", width=80)
         
         # Configure tags for colors
@@ -914,6 +959,35 @@ class App(ctk.CTk):
         
         # Bind double click for links
         self.email_tree.bind('<Double-1>', self.on_tree_double_click)
+        
+        # Context Menu
+        self.email_context_menu = tkinter.Menu(self, tearoff=0)
+        self.email_context_menu.add_command(label="标记为: 可用 (New)", command=lambda: self.mark_selected_status("new"))
+        self.email_context_menu.add_command(label="标记为: 已用 (Used)", command=lambda: self.mark_selected_status("used"))
+        self.email_context_menu.add_command(label="标记为: 无效 (Invalid)", command=lambda: self.mark_selected_status("invalid"))
+        self.email_context_menu.add_separator()
+        self.email_context_menu.add_command(label="删除选中", command=self.delete_selected_email)
+        
+        # Bind Right Click
+        if platform.system() == "Darwin":
+            self.email_tree.bind("<Button-2>", self.show_context_menu)
+            self.email_tree.bind("<Button-3>", self.show_context_menu)
+        else:
+            self.email_tree.bind("<Button-3>", self.show_context_menu)
+
+        # Drag and Drop Support
+        if HAS_DND:
+            try:
+                self.email_tree.drop_target_register(DND_FILES)
+                self.email_tree.dnd_bind('<<Drop>>', self.drop_import_emails)
+                
+                # Also allow dropping on the list frame
+                list_frame.drop_target_register(DND_FILES)
+                list_frame.dnd_bind('<<Drop>>', self.drop_import_emails)
+                
+                ctk.CTkLabel(tool_frame, text="(支持拖拽文件导入)", text_color="gray", font=("Arial", 10)).pack(side='left', padx=5)
+            except Exception as e:
+                print(f"DnD Init Failed: {e}")
 
         # Scrollbars
         vsb = ttk.Scrollbar(list_frame, orient="vertical", command=self.email_tree.yview)
@@ -933,6 +1007,33 @@ class App(ctk.CTk):
         # Initial stats refresh
         self.trigger_refresh(force=True)
 
+    def send_notification(self, title, message):
+        """Send system notification (Cross-platform: macOS/Linux/Windows)"""
+        system = platform.system()
+        try:
+            if system == 'Darwin':
+                subprocess.run(['osascript', '-e', f'display notification "{message}" with title "{title}"'])
+            elif system == 'Linux':
+                subprocess.run(['notify-send', title, message])
+            elif system == 'Windows':
+                try:
+                    t = str(title).replace("'", " ")
+                    m = str(message).replace("'", " ")
+                    cmd = [
+                        'powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command',
+                        f"$wshell = New-Object -ComObject WScript.Shell; $wshell.Popup('{m}',3,'{t}',64)"
+                    ]
+                    subprocess.Popen(cmd)
+                except Exception:
+                    try:
+                        import ctypes
+                        MB_ICONEXCLAMATION = 0x00000030
+                        ctypes.windll.user32.MessageBoxW(0, str(message), str(title), MB_ICONEXCLAMATION)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
     def _check_system_load(self):
         # Only triggered by user action or specific events, not loop
         try:
@@ -940,12 +1041,15 @@ class App(ctk.CTk):
             mem = psutil.virtual_memory().percent
             
             # Log load status to console
-            print(f"[System Load] CPU: {cpu}% | MEM: {mem}% | Mode: Event-Driven")
+            # print(f"[System Load] CPU: {cpu}% | MEM: {mem}% | Mode: Event-Driven")
             
             # Warn if high load
-            if cpu > 85 or mem > 85:
+            if cpu > 90 or mem > 90:
                  if not getattr(self, '_high_load_warned', False):
-                     self.append_log(f"警告: 系统负载较高 (CPU:{cpu}% MEM:{mem}%)")
+                     msg = f"系统负载过高 (CPU:{cpu}% MEM:{mem}%)"
+                     self.append_log(f"警告: {msg}")
+                     if self.headless_mode_var.get():
+                         self.send_notification("KL-Register 资源警告", msg)
                      self._high_load_warned = True
             else:
                  self._high_load_warned = False
@@ -993,7 +1097,7 @@ class App(ctk.CTk):
                      self._ip_low_warned = False
             
             # Email Stats
-            email_stats = self.email_manager.get_stats()
+            email_stats = self.email_pool.get_stats()
             total_emails = email_stats.get('total_emails', 0)
             used_emails = email_stats.get('used_emails', 0) # This comes from email status now
             # Note: The 'used_emails_count' from ip_stats is different (emails used by IPs). 
@@ -1051,10 +1155,11 @@ class App(ctk.CTk):
             try:
                 with open(p, 'r', encoding='utf-8') as f:
                     content = f.read()
-                count = self.email_manager.import_emails(content)
+                # Default overwrite=True to allow resetting status on re-import
+                count = self.email_pool.import_emails(content, overwrite=True)
                 self._update_email_list_ui()
                 self.trigger_refresh(force=True)
-                messagebox.showinfo("导入成功", f"成功导入 {count} 个新邮箱")
+                messagebox.showinfo("导入成功", f"成功导入/更新 {count} 个邮箱")
                 self.append_log(f"导入 {count} 个邮箱来自 {p}")
             except Exception as e:
                 messagebox.showerror("导入失败", str(e))
@@ -1077,7 +1182,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(header_frame, text="批量导入邮箱", font=("Arial", 18, "bold")).pack(side='left')
         
         # Instruction
-        ctk.CTkLabel(main_frame, text="请粘贴邮箱账号 (格式: 账号 密码 或 账号\\t密码):", 
+        ctk.CTkLabel(main_frame, text="请粘贴邮箱账号 (格式: 账号----密码----授权码):", 
                    font=("Arial", 14), text_color="gray").pack(anchor='w', padx=15, pady=(5, 5))
         
         # Text Area with border effect
@@ -1088,15 +1193,22 @@ class App(ctk.CTk):
         text_area.pack(fill='both', expand=True)
         text_area.focus_set()
         
+        # Options
+        opt_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        opt_frame.pack(fill='x', padx=10, pady=5)
+        
+        overwrite_var = tkinter.BooleanVar(value=True)
+        ctk.CTkCheckBox(opt_frame, text="覆盖已存在的邮箱状态", variable=overwrite_var).pack(side='left')
+
         def do_import():
             content = text_area.get("1.0", "end").strip()
             if not content:
                 return
             try:
-                count = self.email_manager.import_emails(content)
+                count = self.email_pool.import_emails(content, overwrite=overwrite_var.get())
                 self._update_email_list_ui()
                 self.trigger_refresh() # Update stats
-                messagebox.showinfo("导入成功", f"成功导入 {count} 个新邮箱")
+                messagebox.showinfo("导入成功", f"成功导入/更新 {count} 个邮箱")
                 self.append_log(f"粘贴导入 {count} 个邮箱")
                 top.destroy()
             except Exception as e:
@@ -1121,13 +1233,13 @@ class App(ctk.CTk):
         if p:
             try:
                 import csv
-                emails = self.email_manager.get_all_emails()
+                emails = self.email_pool.get_all_rows()
                 with open(p, 'w', newline='', encoding='utf-8') as f:
                     writer = csv.writer(f)
                     # Write header
-                    writer.writerow(['email', 'password', 'code_url', 'status'])
+                    writer.writerow(['email', 'password', 'auth_code', 'status'])
                     for e in emails:
-                        writer.writerow([e['email'], e['password'], e['code_url'], ''])
+                        writer.writerow([e['email'], e['password'], e['auth_code'], ''])
                 messagebox.showinfo("导出成功", f"已导出 {len(emails)} 个邮箱到 {p}")
                 
                 # Optionally update the main CSV path
@@ -1153,8 +1265,8 @@ class App(ctk.CTk):
             self.email_tree.delete(item)
             
         # Load
-        emails = self.email_manager.get_all_emails()
-        used_emails = set(self.ip_manager.get_used_emails()) # Optimize with set for lookup
+        emails = self.email_pool.get_all_rows()
+        # used_emails = set(self.ip_manager.get_used_emails()) # Removed: Status should rely on email_pool only
         
         # Filter if search
         query = self.email_search_var.get().strip().lower()
@@ -1169,14 +1281,10 @@ class App(ctk.CTk):
             if query and query not in e['email'].lower():
                 continue
             
-            # Status Logic: Check both Email Manager (persistent) and IP Manager (active bindings)
-            # Email Manager is the source of truth for 'submitted'/'used' state.
+            # Status Logic: Source of truth is email_pool status
             status_val = e.get('status', 'new')
-            is_used = status_val in ("good", "success", "registered", "submitted", "fail_used")
-            
-            # Also check if currently bound to an IP (active usage)
-            if e['email'] in used_emails:
-                is_used = True
+            # "new" or empty string means Unused. Everything else is Used.
+            is_used = status_val not in ("new", "")
             
             if is_used:
                 status = "已用"
@@ -1184,8 +1292,13 @@ class App(ctk.CTk):
             else:
                 status = "可用"
                 tags = ('unused',)
-                
-            self.email_tree.insert("", "end", values=(e['email'], e['password'], e['code_url'], status), tags=tags)
+            
+            # Mask auth code if encrypted
+            auth = e.get('auth_code', '')
+            if auth.startswith('enc:'):
+                auth = "******"
+
+            self.email_tree.insert("", "end", values=(e['email'], e['password'], auth, status), tags=tags)
             count += 1
             
     def on_tree_double_click(self, event):
@@ -1195,23 +1308,90 @@ class App(ctk.CTk):
             return
             
         # column returns #1, #2, etc. corresponding to display columns
-        # Our columns are: email(#1), password(#2), code_url(#3), status(#4)
+        # Our columns are: email(#1), password(#2), auth_code(#3), status(#4)
         
-        if column == '#3': # code_url
-            vals = self.email_tree.item(item, "values")
-            if len(vals) >= 3:
-                url = vals[2]
-                if url and (url.startswith('http') or url.startswith('www')):
-                    if not url.startswith('http'):
-                        url = 'http://' + url
-                        
-                    if messagebox.askyesno("打开链接", f"即将打开外部链接:\n{url}\n\n注意: 请确保链接来源安全！", icon='warning'):
-                         import webbrowser
-                         webbrowser.open_new_tab(url)
+        vals = self.email_tree.item(item, "values")
+        if not vals:
+            return
 
+        val = ""
+        if column == '#1': val = vals[0]
+        elif column == '#2': val = vals[1]
+        elif column == '#3': val = vals[2]
+        elif column == '#4': val = vals[3]
+        
+        if val:
+            self.clipboard_clear()
+            self.clipboard_append(val)
+            self.append_log(f"已复制到剪贴板: {val}")
+
+    def show_context_menu(self, event):
+        try:
+            # Select item under cursor if not selected
+            item = self.email_tree.identify_row(event.y)
+            if item:
+                if item not in self.email_tree.selection():
+                    self.email_tree.selection_set(item)
+            
+            if self.email_tree.selection():
+                self.email_context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.email_context_menu.grab_release()
+
+    def mark_selected_status(self, status):
+        selected = self.email_tree.selection()
+        if not selected:
+            return
+        
+        count = 0
+        for item in selected:
+            vals = self.email_tree.item(item)['values']
+            if vals:
+                email = vals[0]
+                self.email_pool.update_email_status(email, status)
+                count += 1
+        
+        if count > 0:
+            self._update_email_list_ui()
+            self.trigger_refresh(force=True)
+            status_map = {'new': '可用', 'used': '已用', 'invalid': '无效'}
+            self.append_log(f"已将 {count} 个邮箱标记为 {status_map.get(status, status)}")
+
+    def drop_import_emails(self, event):
+        if not event.data:
+            return
+            
+        # Handle file paths from DnD (which might be in curly braces if contain spaces)
+        files = self.tk.splitlist(event.data)
+        total_count = 0
+        
+        for p in files:
+            if not os.path.isfile(p):
+                continue
+                
+            try:
+                # Try UTF-8 first
+                try:
+                    with open(p, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                except UnicodeDecodeError:
+                    # Fallback to GBK
+                    with open(p, 'r', encoding='gbk', errors='ignore') as f:
+                        content = f.read()
+                        
+                count = self.email_pool.import_emails(content, overwrite=True)
+                total_count += count
+                self.append_log(f"拖拽导入 {count} 个邮箱来自 {os.path.basename(p)}")
+            except Exception as e:
+                self.append_log(f"❌ 导入失败 {os.path.basename(p)}: {str(e)}")
+                
+        if total_count > 0:
+            messagebox.showinfo("导入成功", f"成功导入/更新 {total_count} 个邮箱")
+            # Listeners will update UI automatically
+            
     def clear_emails_dialog(self):
         if messagebox.askyesno("确认清空", "确定要清空所有邮箱数据吗？此操作不可撤销！"):
-            self.email_manager.clear_emails()
+            self.email_pool.clear_emails()
             self._update_email_list_ui()
             self.trigger_refresh() # Update stats
             self.append_log("已清空所有邮箱数据")
@@ -1223,25 +1403,26 @@ class App(ctk.CTk):
             messagebox.showwarning("提示", "请输入邮箱地址")
             return
         
-        url = self.email_manager.get_code_url(query)
-        if url:
+        cfg = self.email_pool.get_email_config(query)
+        if cfg:
+            auth = cfg.get('auth_code', '')
             # Show in dialog
             self._update_email_list_ui() # Filter view
             
             # Also show popup
             top = ctk.CTkToplevel(self)
-            top.title("验证码接收地址")
+            top.title("授权码/密码")
             top.geometry("600x150")
             
             ctk.CTkLabel(top, text=f"邮箱: {query}").pack(pady=10)
             entry = ctk.CTkEntry(top, width=500)
             entry.pack(pady=5)
-            entry.insert(0, url)
+            entry.insert(0, auth)
             entry.configure(state='readonly')
             
             def copy():
                 self.clipboard_clear()
-                self.clipboard_append(url)
+                self.clipboard_append(auth)
                 top.destroy()
                 
             ctk.CTkButton(top, text="复制并关闭", command=copy).pack(pady=10)
@@ -1262,7 +1443,7 @@ class App(ctk.CTk):
             vals = self.email_tree.item(item)['values']
             if vals:
                 email = vals[0] # email is first column
-                self.email_manager.delete_email(email)
+                self.email_pool.mark_invalid(email)
                 count += 1
         
         self._update_email_list_ui()
@@ -1295,14 +1476,14 @@ class App(ctk.CTk):
             return
             
         # Prepare task data from Email Manager
-        emails = self.email_manager.get_all_emails()
+        emails = self.email_pool.get_all_rows()
         used_emails = self.ip_manager.get_used_emails()
         valid_rows = []
         
         for e in emails:
             if e['email'] in used_emails:
                 continue
-            valid_rows.append([e['email'], e.get('password',''), e.get('code_url','')])
+            valid_rows.append([e['email'], e.get('password',''), e.get('auth_code','')])
             
         if not valid_rows:
             messagebox.showwarning("提示", "没有可用的邮箱账号 (所有账号均已使用)")
@@ -1313,7 +1494,7 @@ class App(ctk.CTk):
         try:
             with open(temp_csv, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
-                writer.writerow(['email', 'password', 'code_url'])
+                writer.writerow(['email', 'password', 'auth_code'])
                 writer.writerows(valid_rows)
         except Exception as e:
             messagebox.showerror("错误", f"创建临时任务文件失败: {e}")
@@ -1391,9 +1572,9 @@ class App(ctk.CTk):
                     ip_manager=self.ip_manager,
                     exhaustion_cb=exhaustion,
                     target_success_count=target_count,
-                    email_manager=self.email_manager,
-                    silent_mode=self.silent_mode_var.get(),
-                    udp_enabled=self.udp_var.get()
+                            email_pool=self.email_pool,
+                            headless_mode=self.headless_mode_var.get(),
+                            udp_enabled=self.udp_var.get()
                 )
                 self.append_log("任务结束")
             except Exception as e:
@@ -1567,7 +1748,7 @@ class App(ctk.CTk):
             self.udp_var.set(cfg.get('udp_enabled', False))
             
             # IP Config Path
-            ip_conf_path = recover_path(cfg.get('ip_config_path'), 'resources/ip_pool.json', "IP池配置")
+            ip_conf_path = recover_path(cfg.get('ip_config_path'), 'config/ip_pool.json', "IP池配置")
             self.ip_config_path_var.set(ip_conf_path)
             
             # Reload IP Manager if path changed or just to be safe
@@ -1635,71 +1816,35 @@ class App(ctk.CTk):
         except Exception as e:
             self.append_log(str(e))
 
-    def create_tray_icon(self):
-        if not HAS_PYSTRAY:
-            return
-            
-        # Create a simple icon
-        width = 64
-        height = 64
-        color1 = (44, 201, 133) # #2cc985
-        color2 = (255, 255, 255)
-        
-        image = Image.new('RGB', (width, height), color1)
-        dc = ImageDraw.Draw(image)
-        dc.rectangle((width // 2, 0, width, height // 2), fill=color2)
-        dc.rectangle((0, height // 2, width // 2, height), fill=color2)
-        
-        menu = pystray.Menu(
-            pystray.MenuItem("显示窗口", self.show_window),
-            pystray.MenuItem("退出", self.quit_app)
-        )
-        
-        self.tray_icon = pystray.Icon("KL-Reg", image, "KL批量注册", menu)
-        
-    def run_tray(self):
-        if self.tray_icon:
-            self.tray_icon.run()
-
-    def show_window(self, icon=None, item=None):
-        def _ui():
-            try:
-                self.deiconify()
-                self.lift()
-                if self.tray_icon:
-                    try:
-                        self.tray_icon.stop()
-                    except Exception:
-                        pass
-                    self.tray_icon = None
-            except Exception:
-                pass
-        self._run_on_ui(_ui)
-
     def quit_app(self, icon=None, item=None):
-        def _ui():
+        """退出应用程序，带有确认对话框"""
+        def _do_quit():
             try:
-                if self.tray_icon:
-                    try:
-                        self.tray_icon.stop()
-                    except Exception:
-                        pass
+                self.append_log("程序正在退出...")
                 self.stop_registration()
                 self.quit()
                 self.destroy()
                 sys.exit(0)
-            except Exception:
-                pass
+            except Exception as e:
+                self.append_log(f"退出时出错: {e}")
+                
+        def _ui():
+            try:
+                # 如果任务正在进行，先询问用户
+                if self.worker and self.worker.is_alive():
+                    if not messagebox.askyesno("确认退出", "注册任务正在进行中，确定要退出吗？"):
+                        return
+                _do_quit()
+            except Exception as e:
+                # 如果 UI 操作失败，强制退出
+                _do_quit()
+                
         self._run_on_ui(_ui)
 
     def on_closing(self):
-        if self.minimize_to_tray_var.get() and HAS_PYSTRAY:
-            self.withdraw()
-            if not self.tray_icon:
-                self.create_tray_icon()
-            threading.Thread(target=self.run_tray, daemon=True).start()
-        else:
-            self.quit_app()
+        """处理窗口关闭事件"""
+        self.append_log("收到窗口关闭请求")
+        self.quit_app()
 
     def update_resource_stats(self):
         try:
@@ -1751,5 +1896,66 @@ class App(ctk.CTk):
         self.after(self.resource_check_interval, self.update_resource_stats)
 
 
+def handle_exception(exc_type, exc_value, exc_traceback):
+    """Global exception handler to log uncaught exceptions"""
+    import traceback
+    import logging
+    
+    # Log the exception
+    error_msg = ''.join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+    logging.error(f"Uncaught exception:\n{error_msg}")
+    
+    # Also try to write to app.log
+    try:
+        exe_dir = os.path.dirname(os.path.abspath(__file__))
+        base_dir = os.path.dirname(exe_dir)
+        log_path = os.path.join(base_dir, 'logs', 'crash.log')
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Uncaught exception:\n{error_msg}\n")
+    except:
+        pass
+    
+    # Call the default handler
+    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
 if __name__ == '__main__':
-    App().mainloop()
+    # Set up global exception handler
+    sys.excepthook = handle_exception
+    
+    # Ensure logs directory exists
+    try:
+        exe_dir = os.path.dirname(os.path.abspath(__file__))
+        base_dir = os.path.dirname(exe_dir)
+        os.makedirs(os.path.join(base_dir, 'logs'), exist_ok=True)
+    except:
+        pass
+    
+    try:
+        app = App()
+        app.mainloop()
+    except Exception as e:
+        import traceback
+        import logging
+        error_msg = f"Fatal error in main loop: {e}\n{traceback.format_exc()}"
+        logging.error(error_msg)
+        
+        # Write to crash log
+        try:
+            exe_dir = os.path.dirname(os.path.abspath(__file__))
+            base_dir = os.path.dirname(exe_dir)
+            log_path = os.path.join(base_dir, 'logs', 'crash.log')
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {error_msg}\n")
+        except:
+            pass
+        
+        # Show error to user
+        try:
+            import tkinter.messagebox as messagebox
+            messagebox.showerror("程序错误", f"程序发生严重错误:\n{e}\n\n请查看 logs/crash.log 了解详情。")
+        except:
+            print(error_msg)
+        
+        raise

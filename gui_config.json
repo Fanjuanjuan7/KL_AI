@@ -1,9 +1,9 @@
 {
-  "xpaths": "kling_xpaths.json",
+  "xpaths": "config/kling_xpaths.json",
   "bit_url": "http://127.0.0.1:54345",
   "bit_secret": "",
   "platform_url": "https://klingai.com/global/",
-  "concurrency": 3,
+  "concurrency": 1,
   "timeout_ms": 30000,
   "poll_ms": 500,
   "build_output": "dist",
@@ -11,6 +11,6 @@
   "ip_def_user": "UynqJZjUMD",
   "ip_def_pass": "F4qDNjjBHg",
   "ip_def_protocol": "socks5",
-  "ip_config_path": "ip_pool.json",
+  "ip_config_path": "config/ip_pool.json",
   "udp_enabled": true
 }

@@ -1,0 +1,31 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.git
+.mypy_cache
+.pytest_cache
+.hypothesize
+logs/
+dist/
+build/
+*.spec
+.DS_Store
+tmp/
+# Exclude sensitive config or large files if necessary
+# config/email_pool.csv # Maybe keep for now as it might be needed for structure, or provide template
