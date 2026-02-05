@@ -1361,14 +1361,17 @@ def extract_verification_code_unified(driver: webdriver.Remote, email_addr: str,
     # Initialize MailExtractor once
     extractor = None
     
-    # NOTE: JieMa reference implementation does not use proxy for IMAP. 
-    # To ensure high success rate and avoid proxy issues with IMAP ports (993),
-    # we explicitly disable proxy for MailExtractor unless forced via env var.
-    use_imap_proxy = os.getenv("USE_IMAP_PROXY", "false").lower() == "true"
+    # NOTE: Updated to use proxy for IMAP by default to avoid blocking by email providers (e.g. 163.com)
+    # User Request: Use the same proxy as the browser window.
+    # We allow disabling it via env var "DISABLE_IMAP_PROXY" just in case.
+    use_imap_proxy = os.getenv("DISABLE_IMAP_PROXY", "false").lower() != "true"
     imap_proxy = proxy_config if use_imap_proxy else None
     
-    if logger and not use_imap_proxy and proxy_config:
-        logger("Unified Captcha: IMAP Proxy disabled to match reference implementation (JieMa)")
+    if logger and proxy_config:
+        if use_imap_proxy:
+             logger(f"Unified Captcha: IMAP Proxy ENABLED (Addr: {proxy_config.get('addr')})")
+        else:
+             logger("Unified Captcha: IMAP Proxy disabled via env var DISABLE_IMAP_PROXY")
 
     try:
         extractor = MailExtractor(email_addr, password, proxy_config=imap_proxy, logger=logger)
