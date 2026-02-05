@@ -2137,6 +2137,48 @@ def perform_registration(
         result_ok = True # Default to True as per "submit clicked" logic
         
         if popup_closed:
+            if logger: logger("注册判定成功，开始执行状态持久化流程")
+            try:
+                c = driver.get_cookies()
+                if logger: logger(f"当前会话Cookies数量: {len(c)}")
+            except Exception as e:
+                if logger: logger(f"读取Cookies失败: {e}")
+            max_wait = 8
+            start_ts = time.time()
+            last_count = -1
+            stable = 0
+            while time.time() - start_ts < max_wait:
+                try:
+                    c = driver.get_cookies()
+                    cnt = len(c) if c else 0
+                    dc = driver.execute_script("return document.cookie||''")
+                    ok = (cnt > 0) or (dc is not None and len(dc) > 0)
+                    if ok:
+                        # 优化: 如果有 cookies，不需要等 8 秒，只要稳定（或直接）即可
+                        # User Request: "如果是的话 当出现“当前会话Cookies数量: 12”>0就可以立即关闭窗口"
+                        if cnt > 0:
+                            if logger: logger(f"检测到 Cookies ({cnt})，立即结束持久化等待")
+                            break
+                        
+                        if cnt == last_count:
+                            stable += 1
+                            if stable >= 2:
+                                break
+                        else:
+                            stable = 0
+                        last_count = cnt
+                except Exception:
+                    pass
+                time.sleep(1)
+            try:
+                u = driver.current_url
+                if "login" in u.lower() and "dashboard" not in u.lower():
+                    if logger: logger("持久化等待后检测到URL包含login，可能登录状态已丢失")
+                else:
+                    if logger: logger("状态检查通过，Profile应已保存")
+            except Exception:
+                pass
+
              # Strict Email Status Update: Only mark as submitted AFTER successful popup close
             if email_pool:
                 try:
@@ -2149,6 +2191,38 @@ def perform_registration(
         else:
             if logger:
                 logger("步骤: 未找到关闭弹窗按钮或关闭超时，但提交按钮已点击，视为成功")
+            if logger: logger("等待持久化以尝试保存可能的状态")
+            try:
+                c = driver.get_cookies()
+                if logger: logger(f"当前会话Cookies数量: {len(c)}")
+            except Exception as e:
+                if logger: logger(f"读取Cookies失败: {e}")
+            max_wait = 8
+            start_ts = time.time()
+            last_count = -1
+            stable = 0
+            while time.time() - start_ts < max_wait:
+                try:
+                    c = driver.get_cookies()
+                    cnt = len(c) if c else 0
+                    dc = driver.execute_script("return document.cookie||''")
+                    ok = (cnt > 0) or (dc is not None and len(dc) > 0)
+                    if ok:
+                        # 优化: 如果有 cookies，不需要等 8 秒，只要稳定（或直接）即可
+                        if cnt > 0:
+                            if logger: logger(f"检测到 Cookies ({cnt})，立即结束持久化等待")
+                            break
+
+                        if cnt == last_count:
+                            stable += 1
+                            if stable >= 2:
+                                break
+                        else:
+                            stable = 0
+                        last_count = cnt
+                except Exception:
+                    pass
+                time.sleep(1)
             
             # 即使未找到弹窗，也标记为成功，因为"final_submit_btn"已经点击
             # User Request: "Correct to: Fill Email -> Click Submit -> Mark on Success"
@@ -2193,6 +2267,14 @@ def perform_registration(
         # 优化: 使用线程超时机制防止 driver.quit() 卡死 (User Issue: Window stays open)
         try:
             if driver and not hold_close:
+                try:
+                    driver.execute_script("try{document.activeElement && document.activeElement.blur();}catch(e){}")
+                except Exception:
+                    pass
+                try:
+                    driver.get("about:blank")
+                except Exception:
+                    pass
                 def _quit_driver():
                     try:
                         driver.quit()
@@ -2214,8 +2296,7 @@ def perform_registration(
         try:
             if browser_id and not hold_close:
                 if result_ok:
-                    if logger: logger("注册成功，等待数据同步...")
-                    time.sleep(3)
+                    if logger: logger("注册成功，准备关闭窗口")
                 # 无论 driver.quit 是否成功，都尝试调用 close_browser
                 try:
                     client.close_browser(browser_id)

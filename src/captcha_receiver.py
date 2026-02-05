@@ -35,30 +35,35 @@ IMAP_SERVERS = {
 
 class ProxyIMAP4_SSL(imaplib.IMAP4_SSL):
     """IMAP4_SSL with SOCKS proxy support. Matches JieMa implementation style."""
-    def __init__(self, host, port, proxy_config=None):
+    def __init__(self, host, port, proxy_config=None, timeout=None):
         self.proxy_config = proxy_config
-        # Store host/port for socket creation
         self._host = host
         self._port = port
-        # Call parent init - it will call _create_socket
-        super().__init__(host, port)
+        self._timeout = timeout
+        # Pass timeout to super if supported, otherwise just host/port
+        # Python 3.9+ supports timeout in constructor
+        try:
+            super().__init__(host, port, timeout=timeout)
+        except TypeError:
+             super().__init__(host, port)
 
     def _create_socket(self, timeout):
+        # Prefer the timeout passed in init if available and timeout arg is None/default
+        actual_timeout = self._timeout if self._timeout is not None else timeout
+        
         if self.proxy_config:
             s = socks.socksocket()
             s.set_proxy(**self.proxy_config)
-            s.settimeout(timeout)
+            s.settimeout(actual_timeout)
             try:
                 s.connect((self._host, self._port))
             except Exception as e:
                 raise socket.error(f"Proxy connect failed: {e}")
             
-            # Use default SSL context (same as standard imaplib.IMAP4_SSL in Python 3.9+)
             context = ssl.create_default_context()
             return context.wrap_socket(s, server_hostname=self._host)
         else:
-            # Use parent's implementation for direct connection
-            return super()._create_socket(timeout)
+            return super()._create_socket(actual_timeout)
 
 def _safe_log(log_func, message, level="info"):
     """Safely call logger, handling both simple and level-aware loggers"""
@@ -100,10 +105,11 @@ class MailExtractor:
     CODE_REGEX = r'\b\d{4,6}\b'
     SEARCH_CRITERIA = "ALL"
 
-    def __init__(self, email_account: str, password: str, imap_server: str = None, imap_port: int = 993, proxy_config: Optional[Dict] = None, logger: Optional[callable] = None, trace_id: str = None):
+    def __init__(self, email_account: str, password: str, imap_server: str = None, imap_port: int = 993, proxy_config: Optional[Dict] = None, logger: Optional[callable] = None, trace_id: str = None, timeout: int = 20):
         self.email_account = email_account
         self.password = password
         self.proxy_config = proxy_config
+        self.timeout = timeout
         self.mail = None
         self.is_connected = False
         self.custom_logger = logger or (lambda msg, level="info": None)
@@ -159,11 +165,15 @@ class MailExtractor:
             if self.proxy_config:
                 self._log(f"Connecting via Proxy: {self.proxy_config.get('addr')}:{self.proxy_config.get('port')}")
                 # Use ProxyIMAP4_SSL - don't use custom SSL context to match JieMa behavior
-                self.mail = ProxyIMAP4_SSL(self.imap_server, self.imap_port, proxy_config=self.proxy_config)
+                self.mail = ProxyIMAP4_SSL(self.imap_server, self.imap_port, proxy_config=self.proxy_config, timeout=self.timeout)
             else:
                 self._log("Connecting Direct (No Proxy).")
                 # Use standard IMAP4_SSL (JieMa style) - no custom SSL context
-                self.mail = imaplib.IMAP4_SSL(self.imap_server, self.imap_port)
+                try:
+                    self.mail = imaplib.IMAP4_SSL(self.imap_server, self.imap_port, timeout=self.timeout)
+                except TypeError:
+                    self._log("imaplib.IMAP4_SSL does not support timeout arg, falling back to default.", level="warning")
+                    self.mail = imaplib.IMAP4_SSL(self.imap_server, self.imap_port)
                 
             # Login
             self._log(f"Logging in as {self.email_account}...")
