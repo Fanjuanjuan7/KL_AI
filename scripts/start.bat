@@ -1,7 +1,10 @@
 @echo off
 setlocal EnableDelayedExpansion
 
-echo [INFO] Starting KL_AI...
+REM Change to project root directory
+cd /d "%~dp0.."
+
+echo [INFO] Starting KL_AI from %CD%...
 
 REM Check Python
 python --version >nul 2>&1
