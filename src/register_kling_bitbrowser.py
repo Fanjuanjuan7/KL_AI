@@ -11,6 +11,9 @@ from dataclasses import dataclass
 
 import requests
 import urllib.parse
+import traceback
+import platform
+import datetime
 from selenium import webdriver
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
@@ -25,6 +28,92 @@ except ImportError:
     from email_pool import EmailPool
 
 
+class WindowsDumpManager:
+    def __init__(self, logger, email):
+        self.logger = logger
+        self.email = email
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type:
+            try:
+                # Create dump file
+                dump_dir = os.path.join(os.getcwd(), 'logs', 'dumps')
+                os.makedirs(dump_dir, exist_ok=True)
+                timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+                filename = f"dump_{timestamp}_{self.email}.txt"
+                filepath = os.path.join(dump_dir, filename)
+                
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    f.write(f"Timestamp: {timestamp}\n")
+                    f.write(f"Email: {self.email}\n")
+                    f.write(f"Exception: {exc_type.__name__}: {exc_val}\n")
+                    f.write("-" * 50 + "\n")
+                    traceback.print_tb(exc_tb, file=f)
+                    f.write("-" * 50 + "\n")
+                    f.write(f"System: {platform.system()} {platform.release()}\n")
+                    
+                if self.logger:
+                    self.logger(f"已生成错误转储文件: {filepath}")
+            except Exception as e:
+                if self.logger:
+                    self.logger(f"生成转储文件失败: {e}")
+
+class StepRunner:
+    def __init__(self, logger, stop_event, max_cpu=30, max_mem=200):
+        self.logger = logger
+        self.stop_event = stop_event
+        self.max_cpu = max_cpu
+        self.max_mem = max_mem
+        
+    def _check_resources(self):
+        try:
+            for _ in range(5):
+                cpu = psutil.cpu_percent(interval=None) # Non-blocking first check
+                if cpu == 0.0: # First call often returns 0
+                    cpu = psutil.cpu_percent(interval=0.1)
+                
+                mem = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
+                
+                if cpu < self.max_cpu and mem < self.max_mem:
+                    return
+                
+                if self.logger:
+                    self.logger(f"资源繁忙 (CPU={cpu:.1f}%, Mem={mem:.1f}MB)，等待释放...")
+                time.sleep(1)
+        except Exception:
+            pass
+
+    def run(self, name, func, timeout=120):
+        if self.stop_event and self.stop_event.is_set():
+            raise RuntimeError("stopped")
+            
+        self._check_resources()
+            
+        if self.logger:
+            self.logger(f"--- 阶段开始: {name} ---")
+            
+        t0 = time.time()
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(func)
+                res = future.result(timeout=timeout)
+                return res
+        except TimeoutError:
+            if self.logger:
+                self.logger(f"阶段 {name} 超时 ({timeout}s)")
+            raise RuntimeError(f"Step {name} timed out")
+        except Exception as e:
+            if self.logger:
+                self.logger(f"阶段 {name} 异常: {e}")
+            raise e
+        finally:
+            dur = time.time() - t0
+            if self.logger:
+                self.logger(f"--- 阶段结束: {name} (耗时 {dur:.2f}s) ---")
+            time.sleep(0.1)
 
 @dataclass
 class RegistrationEvents:
@@ -1684,836 +1773,542 @@ def perform_registration(
     proxy_password = str(row.get('proxyPassword') or row.get('密码2') or '').strip()
     protocol = str(row.get('protocol') or row.get('proxyType') or 'socks5').strip()
     window_name = str(row.get('windowName') or row.get('窗口名称') or email or 'win').strip()
-    
-    # Construct proxy_config for IMAP connectivity (SOCKS/HTTP)
-    proxy_config = None
-    if host and port:
-        try:
-            ptype = socks.SOCKS5
-            if protocol.lower() == 'http':
-                ptype = socks.HTTP
-            elif protocol.lower() == 'socks4':
-                ptype = socks.SOCKS4
-            
-            proxy_config = {
-                'proxy_type': ptype,
-                'addr': host,
-                'port': int(port),
-                'username': proxy_username if proxy_username else None,
-                'password': proxy_password if proxy_password else None,
-                'rdns': True
-            }
-        except Exception as e:
-            if logger: logger(f"代理配置异常: {e}")
 
-    # Determine Extraction Mode based on auth_code/url format
-    # Standard: auth_code is password/code
-    # XinLan: auth_code starts with http
-    auth_code_or_url = str(row.get('auth_code') or row.get('授权码') or '').strip()
-    extraction_mode = 'imap'
-    extraction_url = None
+    # Resolve dynamic settings if they are callables
+    current_timeout = timeout_ms() if callable(timeout_ms) else timeout_ms
+    current_poll = poll_ms() if callable(poll_ms) else poll_ms
     
-    if auth_code_or_url.startswith('http'):
-        extraction_mode = 'http'
-        extraction_url = auth_code_or_url
-        if logger: logger(f"🔍 智能模式识别: 检测到接码链接，切换至 [心蓝/HTTP模式]")
-        if logger: logger(f"   接码URL: {extraction_url}")
-    else:
-        # Standard IMAP Mode
-        if logger: logger(f"🔍 智能模式识别: 未检测到接码链接，默认为 [IMAP模式]")
-        # Only initialize MailExtractor if NOT http mode
-        pass
-            
-    # Pre-connection check REMOVED as per requirement
-    # We no longer check IMAP connectivity before starting browser.
-    # Failures will be handled during code extraction phase.
+    if logger:
+        logger(f"当前任务参数: Timeout={current_timeout}ms, Poll={current_poll}ms")
 
-
-    try:
-        # Resolve dynamic settings if they are callables
-        current_timeout = timeout_ms() if callable(timeout_ms) else timeout_ms
-        current_poll = poll_ms() if callable(poll_ms) else poll_ms
+    # Windows Compatibility: Dump Manager & Step Runner
+    with WindowsDumpManager(logger, email) as dump_mgr:
+        runner = StepRunner(logger, stop_event, max_cpu=30, max_mem=200)
         
-        if logger:
-            logger(f"当前任务参数: Timeout={current_timeout}ms, Poll={current_poll}ms")
-    
-        # Early target check
-        if target_check and target_check():
-            return False, 'target_reached'
+        # Shared Context for Steps
+        ctx = {
+            'driver': None,
+            'browser_id': None,
+            'gate_state': None,
+            't_attached': 0,
+            'open_data': None,
+            'debug_tab_opened': False
+        }
+        
+        # ---------------------------------------------------------------------
+        # Step 1: Verification & Initialization (验证)
+        # ---------------------------------------------------------------------
+        def step_verify():
+            # Email Validation Logic
+            if email_pool:
+                is_valid, reason = email_pool.check_email_availability(email)
+                if not is_valid:
+                    # Allow 'processing' as it is set by the current task runner immediately before execution
+                    if reason == "正在处理中":
+                        pass
+                    else:
+                        log_time = time.strftime('%Y-%m-%d %H:%M:%S')
+                        audit_msg = f"Audit: Invalid Email Rejected | Time: {log_time} | IP: {host} | Email: {email} | Reason: {reason}"
+                        if logger: logger(audit_msg)
+                        raise RuntimeError(f"Email unavailable: {reason}")
             
-        if stop_event and stop_event.is_set():
-            return False, 'stopped'
-        if logger:
-            logger(f"create_profile {window_name}")
-        browser_id = None
-        driver = None
-        result_ok = False
-        
-        # Optimization: Disable QUIC to prevent UDP timeouts on proxies (common cause of page load hangs)
-        browser_cmd_args = ["--disable-quic"]
-        
-        try:
-            browser_id = client.update_browser(window_name, proxy_payload(host, port, proxy_username, proxy_password, protocol), enable_udp=udp_enabled, cmd_args=browser_cmd_args)
-        except Exception:
-            # 如果更新失败（如不存在），尝试创建
+            # Construct proxy_config
+            proxy_config = None
+            if host and port:
+                try:
+                    ptype = socks.SOCKS5
+                    if protocol.lower() == 'http':
+                        ptype = socks.HTTP
+                    elif protocol.lower() == 'socks4':
+                        ptype = socks.SOCKS4
+                    
+                    proxy_config = {
+                        'proxy_type': ptype,
+                        'addr': host,
+                        'port': int(port),
+                        'username': proxy_username if proxy_username else None,
+                        'password': proxy_password if proxy_password else None,
+                        'rdns': True
+                    }
+                except Exception as e:
+                    if logger: logger(f"代理配置异常: {e}")
+
+            # Early target check
+            if target_check and target_check():
+                raise RuntimeError('target_reached')
+                
+            if stop_event and stop_event.is_set():
+                raise RuntimeError('stopped')
+
+            if logger: logger(f"create_profile {window_name}")
+            
+            # Optimization: Disable QUIC
+            browser_cmd_args = ["--disable-quic"]
+            
+            browser_id = None
             try:
-                browser_id = client.create_browser(window_name, proxy_payload(host, port, proxy_username, proxy_password, protocol), enable_udp=udp_enabled, cmd_args=browser_cmd_args)
-            except Exception as create_err:
-                if logger:
-                    logger(f"创建窗口失败: {create_err}")
-                return False, f"create_browser failed: {create_err}"
-        if logger:
-            logger(f"profile_id {browser_id}")
-        open_data = client.open_browser(browser_id)
-        if logger:
-            logger(f"open_browser {browser_id} -> {open_data}")
-        if not (open_data.get('driver') and open_data.get('http')):
-            raise RuntimeError(f"open_browser 未返回 driver/http: {open_data}")
-        
-        # Wait for browser to fully start
-        time.sleep(5)
-        
-        try:
-            driver = open_attached_driver(open_data)
-        except Exception as attach_err:
-            if logger:
-                logger(f"连接浏览器失败，尝试重试: {attach_err}")
-            time.sleep(3)
-            driver = open_attached_driver(open_data)
-        t_attached = time.time()
-        gate_state = 'attached'
-        debug_tab_opened = False
-        
-        # Headless Mode: Move window off-screen instead of minimize for stability
-        if headless_mode:
-            try:
-                driver.set_window_position(-3000, 0)
+                browser_id = client.update_browser(window_name, proxy_payload(host, port, proxy_username, proxy_password, protocol), enable_udp=udp_enabled, cmd_args=browser_cmd_args)
             except Exception:
                 try:
-                    driver.minimize_window()
-                except Exception:
-                    pass
-
-        result_ok = False
-        if logger:
-            logger("步骤: 打开平台网址")
-        if not check_connectivity(driver, platform_url, logger, max_wait=45):
-            take_screenshot(driver, f"{window_name}_connectivity_failed.png", logger)
-            return False, 'proxy_connectivity_failed'
-        # 页面就绪与加载时间
-        wait_page_ready(driver, 45)
-        log_page_timing(driver, logger)
-        log_resource_status(driver, logger)
-        # DOM 可见性校验，确保关键入口元素已渲染
-        # 针对代理网络不稳定的情况，将超时时间从 10s 增加到 30s，并优化重试逻辑
-        try:
-            if not element_visible(driver, xpaths.get('language_menu', ''), min(current_timeout, 30000), current_poll):
-                if logger:
-                    logger("DOM状态校验失败: language_menu 未可见 (30s)，尝试刷新后重试")
+                    browser_id = client.create_browser(window_name, proxy_payload(host, port, proxy_username, proxy_password, protocol), enable_udp=udp_enabled, cmd_args=browser_cmd_args)
+                except Exception as create_err:
+                    if logger: logger(f"创建窗口失败: {create_err}")
+                    raise RuntimeError(f"create_browser failed: {create_err}")
+            
+            ctx['browser_id'] = browser_id
+            if logger: logger(f"profile_id {browser_id}")
+            
+            open_data = client.open_browser(browser_id)
+            ctx['open_data'] = open_data
+            if logger: logger(f"open_browser {browser_id} -> {open_data}")
+            
+            if not (open_data.get('driver') and open_data.get('http')):
+                raise RuntimeError(f"open_browser 未返回 driver/http: {open_data}")
+            
+            # Wait for browser to fully start
+            time.sleep(5)
+            
+            driver = None
+            try:
+                driver = open_attached_driver(open_data)
+            except Exception as attach_err:
+                if logger: logger(f"连接浏览器失败，尝试重试: {attach_err}")
+                time.sleep(3)
+                driver = open_attached_driver(open_data)
+                
+            ctx['driver'] = driver
+            ctx['t_attached'] = time.time()
+            ctx['gate_state'] = 'attached'
+            
+            # Headless Mode
+            if headless_mode:
                 try:
-                    driver.refresh()
+                    driver.set_window_position(-3000, 0)
                 except Exception:
-                    pass
-                wait_page_ready(driver, 45) # 增加页面就绪等待时间
-                log_page_timing(driver, logger)
-                log_resource_status(driver, logger)
-                if not element_visible(driver, xpaths.get('language_menu', ''), min(current_timeout, 30000), current_poll):
-                    if logger:
-                        logger("DOM状态校验仍失败: language_menu 未可见，继续后续入口以免阻塞")
-        except Exception:
-            pass
-        ready = False
-        
-        for xp_key in ('language_menu', 'signin_btn', 'Creative Studio'):
-            try:
-                xp_val = xpaths.get(xp_key)
-                if xp_val and element_exists(driver, xp_val, 8000, current_poll):
-                    ready = True
-                    break
-            except Exception:
-                pass
-        if not ready:
-            try:
-                driver.refresh()
-            except Exception:
-                pass
-            wait_page_ready(driver, 20)
+                    try: driver.minimize_window()
+                    except: pass
+
+            if logger: logger("步骤: 打开平台网址")
+            if not check_connectivity(driver, platform_url, logger, max_wait=45):
+                take_screenshot(driver, f"{window_name}_connectivity_failed.png", logger)
+                raise RuntimeError('proxy_connectivity_failed')
+                
+            # Page Ready
+            wait_page_ready(driver, 45)
             log_page_timing(driver, logger)
             log_resource_status(driver, logger)
+            
+            # DOM Check
+            try:
+                if not element_visible(driver, xpaths.get('language_menu', ''), min(current_timeout, 30000), current_poll):
+                    if logger: logger("DOM状态校验失败: language_menu 未可见 (30s)，尝试刷新后重试")
+                    try: driver.refresh()
+                    except: pass
+                    wait_page_ready(driver, 45)
+                    log_page_timing(driver, logger)
+                    log_resource_status(driver, logger)
+                    if not element_visible(driver, xpaths.get('language_menu', ''), min(current_timeout, 30000), current_poll):
+                        if logger: logger("DOM状态校验仍失败: language_menu 未可见，继续后续入口以免阻塞")
+            except Exception:
+                pass
+
+        # ---------------------------------------------------------------------
+        # Step 2: Write & Interact (写入)
+        # ---------------------------------------------------------------------
+        def step_write():
+            driver = ctx['driver']
+            open_data = ctx['open_data']
+            
+            # Check Ready
+            ready = False
             for xp_key in ('language_menu', 'signin_btn', 'Creative Studio'):
                 try:
                     xp_val = xpaths.get(xp_key)
                     if xp_val and element_exists(driver, xp_val, 8000, current_poll):
                         ready = True
                         break
-                except Exception:
-                    pass
-        # 为降低早期关闭概率，首页阶段默认不尝试通过调试接口创建新标签
-        # 若启用 UDP 调试模式，则允许使用调试接口打开新标签以作为回退
-        enable_debugger_open = bool(udp_enabled)
-        if enable_debugger_open and (not ready) and open_data.get('http'):
-            if not debug_tab_opened:
-                prev_handles = driver.window_handles
-                open_tab_via_debugger(open_data.get('http') or '', platform_url, logger)
-                try:
-                    WebDriverWait(driver, 8).until(lambda d: len(d.window_handles) > len(prev_handles))
-                    driver.switch_to.window(driver.window_handles[-1])
-                except Exception:
-                    pass
-                debug_tab_opened = True
-        # 语言菜单存在性验证与点击
-        if logger:
-            try:
-                cnt = xpath_count(driver, xpaths['language_menu'])
-                logger(f"XPath检测 language_menu count={cnt}")
-            except Exception:
-                pass
-        lang_clicked = False
-        if safe_click_any(driver, [xpaths.get('language_menu'), xpaths.get('language_menu_alt')], current_timeout, current_poll, logger, retries=2) or js_click_xpath(driver, xpaths.get('language_menu', '')) or js_click_xpath(driver, xpaths.get('language_menu_alt', '')):
-            if logger:
-                logger("步骤: 打开语言菜单")
-            lang_clicked = True
-            try:
-                WebDriverWait(driver, min(current_timeout, 8000) / 1000.0).until(EC.presence_of_element_located((By.XPATH, xpaths.get('english_option') or xpaths.get('english_option_alt') or "//*[@role='menu']")))
-            except Exception:
-                pass
-            if not safe_click_any(driver, [xpaths.get('english_option'), xpaths.get('english_option_alt')], current_timeout, current_poll, logger, retries=2):
-                if not js_click_xpath(driver, xpaths.get('english_option', '')) and not js_click_xpath(driver, xpaths.get('english_option_alt', '')):
-                    return False, 'english_option_click_failed'
-        else:
-            # 未能点击语言菜单，但继续尝试后续入口
-            pass
-        if logger:
-            logger("步骤: 选择英文" + ("(已点击语言菜单)" if lang_clicked else "(跳过语言菜单点击)"))
-        if stop_event and stop_event.is_set():
-            return False, 'stopped'
-        if logger:
-            logger("步骤: 点击 Creative Studio")
-        if not safe_click_any(driver, [
-            xpaths.get('Creative Studio'),
-            "//*[contains(text(),'Creative') or contains(text(),'创意') or contains(text(),'工作室')]"
-        ], current_timeout, current_poll, logger, retries=2):
-            try:
-                find_click(driver, xpaths.get('Creative Studio') or "//*[contains(text(),'Creative') or contains(text(),'创意') or contains(text(),'工作室')]", current_timeout, current_poll)
-            except Exception as e:
-                return False, str(e)
-        if logger:
-            logger("步骤: 点击 More Tools")
-        prev_handles = driver.window_handles
-        gate_state = 'pre_open_more_tools'
-        if not safe_click_any(driver, [
-            xpaths.get('More Tools'),
-            "//*[contains(text(),'More') or contains(text(),'更多') or contains(text(),'工具')]"
-        ], current_timeout, current_poll, logger, retries=2):
-            return False, 'more_tools_click_failed'
-        try:
-            WebDriverWait(driver, min(8, current_timeout / 1000.0), poll_frequency=current_poll / 1000.0).until(lambda d: len(d.window_handles) > len(prev_handles))
-        except Exception:
-            pass
-        time.sleep(1.5)
-        handle_lock = threading.Lock()
-        with handle_lock:
-            try:
-                new_handles = driver.window_handles
-                diff = [h for h in new_handles if h not in prev_handles]
-                if diff:
-                    driver.switch_to.window(diff[-1])
-                else:
-                    driver.switch_to.window(driver.window_handles[-1])
-                gate_state = 'tab_switched'
-            except Exception:
-                pass
-        if logger:
-            logger("步骤: 已切换到新标签")
-        wait_page_ready(driver, 20)
-        try:
-            log_browser_console(driver, logger, 20)
-        except Exception:
-            pass
-        try:
-            log_performance_network(driver, logger, 100, domain_filter=None)
-        except Exception:
-            pass
-        try:
-            log_resource_status(driver, logger)
-        except Exception:
-            pass
-        time.sleep(0.5)
-        if logger:
-            logger("步骤: 点击 Sign In")
-        if not safe_click_any(driver, [
-            xpaths.get('signin_btn'),
-            "//*[contains(text(),'Sign In') or contains(text(),'登录')]"
-        ], current_timeout, current_poll, logger, retries=2):
-            return False, 'signin_click_failed'
-        try:
-            WebDriverWait(driver, min(current_timeout, 10000) / 1000.0).until(EC.presence_of_element_located((By.XPATH, xpaths.get('signin_with_email') or xpaths.get('signin_with_email_alt') or "//*")))
-        except Exception:
-            pass
-        if logger:
-            logger("步骤: 选择邮箱登录")
-        if not safe_click_any(driver, [
-            xpaths.get('signin_with_email'),
-            "//*[contains(text(),'邮箱') or contains(text(),'email') or contains(text(),'邮件')]"
-        ], current_timeout, current_poll, logger, retries=2):
-            return False, 'signin_email_click_failed'
-        try:
-            WebDriverWait(driver, min(current_timeout, 10000) / 1000.0).until(EC.presence_of_element_located((By.XPATH, xpaths.get('Sign up for free') or "//*[contains(text(),'免费') or contains(text(),'注册') or contains(text(),'Sign up')]")))
-        except Exception:
-            pass
-        if logger:
-            logger("步骤: 点击免费注册")
-        if not safe_click_any(driver, [
-            xpaths.get('Sign up for free'),
-            "//*[contains(text(),'免费') or contains(text(),'注册') or contains(text(),'Sign up')]"
-        ], current_timeout, current_poll, logger, retries=2):
-            return False, 'signup_click_failed'
-        try:
-            WebDriverWait(driver, min(current_timeout, 12000) / 1000.0).until(EC.presence_of_element_located((By.XPATH, xpaths.get('Enter Email Address') or "//*[@placeholder][contains(@placeholder,'邮箱') or contains(@placeholder,'Email')]")))
-        except Exception:
-            pass
-        if logger:
-            logger("步骤: 输入邮箱")
-        if not safe_send_keys_any(driver, [
-            xpaths.get('Enter Email Address'),
-            "//*[@placeholder][contains(@placeholder,'邮箱') or contains(@placeholder,'Email')]"
-        ], email, current_timeout, current_poll, logger, retries=1):
-            return False, 'email_input_failed'
-        if logger:
-            logger("步骤: 输入密码")
-        if not safe_send_keys_any(driver, [
-            xpaths.get('password_input'),
-            "//*[@placeholder][contains(@placeholder,'密码') or contains(@placeholder,'Password')]"
-        ], password, current_timeout, current_poll, logger, retries=1):
-            return False, 'password_input_failed'
-        if logger:
-            logger("步骤: 确认密码")
-        if not safe_send_keys_any(driver, [
-            xpaths.get('Confirm Password'),
-            "//*[@placeholder][contains(@placeholder,'确认') or contains(@placeholder,'Confirm')]"
-        ], password, current_timeout, current_poll, logger, retries=1):
-            return False, 'confirm_input_failed'
-        if logger:
-            logger("步骤: 点击下一步")
-        if not safe_click_any(driver, [
-            xpaths.get('next_btn'),
-            "//*[contains(text(),'下一步') or contains(text(),'Next')]"
-        ], current_timeout, current_poll, logger, retries=2):
-            return False, 'next_click_failed'
-        gate_state = 'registration_started'
-
-        try:
-            # Check for generic error message
-            if element_visible(driver, "//*[contains(text(), 'registered') or contains(text(), 'used')]", 2000, current_poll):
-                body_text = driver.find_element(By.TAG_NAME, 'body').text.lower()
-                if "already registered" in body_text or "already used" in body_text or "account exists" in body_text:
-                    if logger: logger("检测到邮箱已被使用提示")
-                    if email_pool:
-                        email_pool.update_email_status(email, 'fail_used')
-                    return False, 'email_used_prompt'
-        except Exception:
-            pass
-
-        if logger:
-            logger("步骤: 等待并通过滑块")
-        if stop_event and stop_event.is_set():
-            return False, 'stopped'
-        code_input_el_xpath = xpaths.get('code_url_element')
-        if not code_input_el_xpath:
-            return False, 'code_input_xpath_missing'
-        t_slider = time.time()
-        slider_ok = False
-        max_slider_retries = 8
-        slider_iframe_xpath = xpaths.get('slider_iframe')
-        slider_container_xpath = xpaths.get('slider_container')
-        for attempt in range(max_slider_retries):
-            if stop_event and stop_event.is_set():
-                return False, 'stopped'
-            if attempt > 0 and logger:
-                logger(f"Slider: 重试 {attempt+1}/{max_slider_retries}")
-            if solve_slider(driver, xpaths, current_timeout, current_poll, logger=logger):
-                slider_ok = True
-                break
-            if attempt < max_slider_retries - 1:
-                try:
+                except: pass
+            
+            if not ready:
+                try: driver.refresh()
+                except: pass
+                wait_page_ready(driver, 20)
+                # Retry check... (simplified)
+            
+            # Debugger Tab
+            enable_debugger_open = bool(udp_enabled)
+            if enable_debugger_open and (not ready) and open_data.get('http'):
+                if not ctx['debug_tab_opened']:
+                    prev_handles = driver.window_handles
+                    open_tab_via_debugger(open_data.get('http') or '', platform_url, logger)
                     try:
-                        driver.switch_to.default_content()
-                    except Exception:
-                        pass
-                    t_wait = time.time()
-                    while time.time() - t_wait < 6:
-                        if stop_event and stop_event.is_set():
-                            return False, 'stopped'
-                        if element_visible(driver, code_input_el_xpath, 400, current_poll):
-                            break
-                        if (slider_iframe_xpath and element_visible(driver, slider_iframe_xpath, 400, current_poll)) or (slider_container_xpath and element_visible(driver, slider_container_xpath, 400, current_poll)):
-                            break
-                        time.sleep(0.3)
-                except Exception:
-                    pass
-        if not slider_ok:
-            return False, 'slider_failed'
-        if logger:
-            logger(f"步骤: 滑块通过 (耗时 {time.time()-t_slider:.2f}s)")
+                        WebDriverWait(driver, 8).until(lambda d: len(d.window_handles) > len(prev_handles))
+                        driver.switch_to.window(driver.window_handles[-1])
+                    except: pass
+                    ctx['debug_tab_opened'] = True
+            
+            # Language Menu
+            lang_clicked = False
+            if safe_click_any(driver, [xpaths.get('language_menu'), xpaths.get('language_menu_alt')], current_timeout, current_poll, logger, retries=2) or js_click_xpath(driver, xpaths.get('language_menu', '')) or js_click_xpath(driver, xpaths.get('language_menu_alt', '')):
+                if logger: logger("步骤: 打开语言菜单")
+                lang_clicked = True
+                try: WebDriverWait(driver, min(current_timeout, 8000) / 1000.0).until(EC.presence_of_element_located((By.XPATH, xpaths.get('english_option') or xpaths.get('english_option_alt') or "//*[@role='menu']")))
+                except: pass
+                if not safe_click_any(driver, [xpaths.get('english_option'), xpaths.get('english_option_alt')], current_timeout, current_poll, logger, retries=2):
+                    if not js_click_xpath(driver, xpaths.get('english_option', '')) and not js_click_xpath(driver, xpaths.get('english_option_alt', '')):
+                        raise RuntimeError('english_option_click_failed')
+            
+            if logger: logger("步骤: 选择英文" + ("(已点击语言菜单)" if lang_clicked else "(跳过语言菜单点击)"))
+            
+            if stop_event and stop_event.is_set(): raise RuntimeError('stopped')
+            
+            # Navigate to Sign Up
+            if logger: logger("步骤: 点击 Creative Studio")
+            if not safe_click_any(driver, [xpaths.get('Creative Studio'), "//*[contains(text(),'Creative') or contains(text(),'创意') or contains(text(),'工作室')]"], current_timeout, current_poll, logger, retries=2):
+                try: find_click(driver, xpaths.get('Creative Studio') or "//*[contains(text(),'Creative') or contains(text(),'创意') or contains(text(),'工作室')]", current_timeout, current_poll)
+                except Exception as e: raise RuntimeError(str(e))
+                
+            if logger: logger("步骤: 点击 More Tools")
+            prev_handles = driver.window_handles
+            ctx['gate_state'] = 'pre_open_more_tools'
+            if not safe_click_any(driver, [xpaths.get('More Tools'), "//*[contains(text(),'More') or contains(text(),'更多') or contains(text(),'工具')]"], current_timeout, current_poll, logger, retries=2):
+                raise RuntimeError('more_tools_click_failed')
+                
+            try: WebDriverWait(driver, min(8, current_timeout / 1000.0), poll_frequency=current_poll / 1000.0).until(lambda d: len(d.window_handles) > len(prev_handles))
+            except: pass
+            
+            time.sleep(1.5)
+            handle_lock = threading.Lock()
+            with handle_lock:
+                try:
+                    new_handles = driver.window_handles
+                    diff = [h for h in new_handles if h not in prev_handles]
+                    if diff: driver.switch_to.window(diff[-1])
+                    else: driver.switch_to.window(driver.window_handles[-1])
+                    ctx['gate_state'] = 'tab_switched'
+                except: pass
+                
+            if logger: logger("步骤: 已切换到新标签")
+            wait_page_ready(driver, 20)
+            
+            time.sleep(0.5)
+            if logger: logger("步骤: 点击 Sign In")
+            if not safe_click_any(driver, [xpaths.get('signin_btn'), "//*[contains(text(),'Sign In') or contains(text(),'登录')]"], current_timeout, current_poll, logger, retries=2):
+                raise RuntimeError('signin_click_failed')
+                
+            try: WebDriverWait(driver, min(current_timeout, 10000) / 1000.0).until(EC.presence_of_element_located((By.XPATH, xpaths.get('signin_with_email') or xpaths.get('signin_with_email_alt') or "//*")))
+            except: pass
+            
+            if logger: logger("步骤: 选择邮箱登录")
+            if not safe_click_any(driver, [xpaths.get('signin_with_email'), "//*[contains(text(),'邮箱') or contains(text(),'email') or contains(text(),'邮件')]"], current_timeout, current_poll, logger, retries=2):
+                raise RuntimeError('signin_email_click_failed')
+                
+            try: WebDriverWait(driver, min(current_timeout, 10000) / 1000.0).until(EC.presence_of_element_located((By.XPATH, xpaths.get('Sign up for free') or "//*[contains(text(),'免费') or contains(text(),'注册') or contains(text(),'Sign up')]")))
+            except: pass
+            
+            if logger: logger("步骤: 点击免费注册")
+            if not safe_click_any(driver, [xpaths.get('Sign up for free'), "//*[contains(text(),'免费') or contains(text(),'注册') or contains(text(),'Sign up')]"], current_timeout, current_poll, logger, retries=2):
+                raise RuntimeError('signup_click_failed')
+                
+            try: WebDriverWait(driver, min(current_timeout, 12000) / 1000.0).until(EC.presence_of_element_located((By.XPATH, xpaths.get('Enter Email Address') or "//*[@placeholder][contains(@placeholder,'邮箱') or contains(@placeholder,'Email')]")))
+            except: pass
+            
+            # Form Filling
+            if logger: logger("步骤: 输入邮箱")
+            if not safe_send_keys_any(driver, [xpaths.get('Enter Email Address'), "//*[@placeholder][contains(@placeholder,'邮箱') or contains(@placeholder,'Email')]"], email, current_timeout, current_poll, logger, retries=1):
+                raise RuntimeError('email_input_failed')
+                
+            if logger: logger("步骤: 输入密码")
+            if not safe_send_keys_any(driver, [xpaths.get('password_input'), "//*[@placeholder][contains(@placeholder,'密码') or contains(@placeholder,'Password')]"], password, current_timeout, current_poll, logger, retries=1):
+                raise RuntimeError('password_input_failed')
+                
+            if logger: logger("步骤: 确认密码")
+            if not safe_send_keys_any(driver, [xpaths.get('Confirm Password'), "//*[@placeholder][contains(@placeholder,'确认') or contains(@placeholder,'Confirm')]"], password, current_timeout, current_poll, logger, retries=1):
+                raise RuntimeError('confirm_input_failed')
+                
+            if logger: logger("步骤: 点击下一步")
+            if not safe_click_any(driver, [xpaths.get('next_btn'), "//*[contains(text(),'下一步') or contains(text(),'Next')]"], current_timeout, current_poll, logger, retries=2):
+                raise RuntimeError('next_click_failed')
+                
+            ctx['gate_state'] = 'registration_started'
+            
+            # Check Used Email
             try:
-                log_resource_phase_timings(driver, logger, contains="captcha", limit=30)
-            except Exception:
-                pass
-        
-        # 强制等待5秒，防止滑块刚过就去接码，导致接到旧验证码
-        if logger: logger("步骤: 滑块通过，强制等待 5 秒...")
-        time.sleep(1)
-
-        # 优化: 滑块通过后，直接跳转接码页等待验证码
-        if logger:
-            logger("步骤: 滑块通过，立即跳转接码页等待验证码")
-        
-        # 在等待过程中动态检查停止与目标达成
-        if stop_event and stop_event.is_set():
-            return False, 'stopped'
-        if target_check and target_check():
-            if logger: logger("终止接码：已达到目标注册数量")
-            return False, 'target_reached'
-
-        # 直接调用接码流程 (内部负责打开、刷新、提取)
-        # Multilingual Resend XPath fallback
-        default_resend_xp = "//a[contains(text(), 'Resend Code') or contains(text(), '重新发送') or contains(text(), '再发一条')]"
-        resend_xp = xpaths.get('resend_code') or default_resend_xp
-        
-        # Unified Captcha Flow
-        # Use auth_code if available (for IMAP), otherwise password
-        # Support 'code_url' as legacy alias (due to previous gui_ctk mismatch)
-        auth_code_val = row.get('auth_code') or row.get('授权码') or row.get('authCode') or row.get('code_url')
-        pwd_val = row.get('password') or row.get('密码')
-        
-        password_for_imap = str(auth_code_val or pwd_val or '').strip()
-        
-        if logger:
-            # Mask credentials for safety
-            masked_auth = f"{str(auth_code_val)[:2]}...{str(auth_code_val)[-2:]}" if auth_code_val and len(str(auth_code_val)) > 4 else "None/Short"
-            masked_pwd = f"{str(pwd_val)[:2]}...{str(pwd_val)[-2:]}" if pwd_val and len(str(pwd_val)) > 4 else "None/Short"
-            used_cred_type = "AuthCode" if auth_code_val else "Password"
-            logger(f"Unified Captcha: Credential Check - AuthCode: {bool(auth_code_val)} ({masked_auth}), Password: {bool(pwd_val)} ({masked_pwd}), Using: {used_cred_type}")
-            
-        if not password_for_imap:
-             if logger: logger("❌ 错误: 缺少密码/授权码，无法获取验证码。")
-             return False, 'missing_credentials'
-
-        if logger: logger("使用 Unified Captcha 模式获取验证码...")
-        # 额外防呆: 163/126/QQ 邮箱若使用密码而非授权码，IMAP登录极大概率失败
-        try:
-            domain = (email.split('@')[-1] or '').lower()
-            # 简单判断: 如果是网易/QQ系且没有单独提供 auth_code (即 auth_code_val 为空)，则发出警告
-            if domain in ('163.com', '126.com', 'qq.com'):
-                if not auth_code_val:
-                     if logger:
-                        logger(f"⚠️ 风险提示: {domain} 邮箱通常需要独立的授权码(AuthCode)才能登录IMAP，当前仅检测到密码(Password)。", level="warning")
-                elif auth_code_val == pwd_val:
-                     if logger:
-                        logger(f"⚠️ 风险提示: {domain} 邮箱的授权码与密码相同。请确认您使用的是IMAP专用授权码，而非网页登录密码。", level="warning")
-        except Exception:
-            pass
-        code = extract_verification_code_unified(
-            driver, 
-            email, 
-            password_for_imap, 
-            resend_xp, 
-            logger, 
-            timeout=400, 
-            proxy_config=proxy_config, 
-            stop_event=stop_event,
-            extraction_mode=extraction_mode,
-            extraction_url=extraction_url
-        )
-        
-        if not code:
-            if logger:
-                logger("步骤: 获取验证码失败(超时)")
-            # 诊断: 检查是否滑块重现(导致根本没发码)
-            try:
-                if (slider_iframe_xpath and element_visible(driver, slider_iframe_xpath, 1000, current_poll)) or \
-                   (slider_container_xpath and element_visible(driver, slider_container_xpath, 1000, current_poll)):
-                    if logger: logger("诊断: 滑块验证框重新出现，判定为滑块实际上未通过")
-                    return False, 'slider_reappeared'
-            except Exception:
-                pass
-            return False, 'code_not_found'
-
-        gate_state = 'code_received'
-        if logger:
-            logger("步骤: 获取验证码成功，已切回主窗口")
-
-        # Switch to default content to ensure we are not stuck in an iframe
-        try:
-            driver.switch_to.default_content()
-        except Exception:
-            pass
-
-        # 3. 拿到验证码后，等待输入框出现并填入
-        try:
-            t0 = time.time()
-            if logger: logger("正在等待验证码输入框...")
-            
-            # Use multiple locators for robustness
-            input_locators = [
-                code_input_el_xpath,
-                "//input[@autocomplete='one-time-code']",
-                "//input[contains(@placeholder, 'verification') or contains(@placeholder, 'code') or contains(@placeholder, '验证码')]",
-                "//input[@type='text' and string-length(@maxlength)='6']"
-            ]
-            # Filter None/Empty and unique
-            input_locators = list(dict.fromkeys([x for x in input_locators if x]))
-            
-            found_input_xpath = None
-            for xp in input_locators:
-                 try:
-                     if element_visible(driver, xp, 1000, current_poll):
-                         found_input_xpath = xp
-                         break
-                 except:
-                     pass
-            
-            if not found_input_xpath:
-                # Retry finding any valid input for a short period
-                end_find = time.time() + 10
-                while time.time() < end_find:
-                    for xp in input_locators:
-                        try:
-                            if element_visible(driver, xp, 500, current_poll):
-                                found_input_xpath = xp
-                                break
-                        except:
-                            pass
-                    if found_input_xpath:
-                        break
-                    time.sleep(1)
-
-            if not found_input_xpath:
-                if logger: logger("验证码输入框未出现(超时)")
-                # 再次诊断
-                try:
-                    body_text = driver.find_element(By.TAG_NAME, 'body').text
-                    if "frequent" in body_text.lower() or "try again" in body_text.lower():
-                         if logger: logger(f"诊断: 页面包含错误提示")
-                except Exception:
-                    pass
-                return False, 'code_input_not_visible'
-
-            if logger: logger(f"验证码输入框就绪: {found_input_xpath} (耗时 {time.time()-t0:.2f}s)")
-            
-            # Fill the code
-            el = driver.find_element(By.XPATH, found_input_xpath)
-            el.clear()
-            el.send_keys(code)
-            
-        except Exception:
-            if logger: logger("验证码填写异常")
-            return False, 'code_input_error'
-        
-        # 3. Input code (Legacy block removed as we did it above)
-        if target_check and target_check():
-            if logger: logger("终止提交：已达到目标注册数量")
-            return False, 'target_reached'
-            
-        if logger:
-            logger("步骤: 填写验证码")
-        
-        if target_check and target_check():
-            if logger: logger("终止提交：已达到目标注册数量")
-            return False, 'target_reached'
-        find_click_any(driver, xpaths['final_submit_btn'], current_timeout, current_poll)
-        
-        # 强制等待 1 秒，防止提交过快
-        if logger: logger("提交后强制等待 1 秒...")
-        time.sleep(1)
-
-        try:
-            log_performance_network(driver, logger, 100, domain_filter=None)
-        except Exception:
-            pass
-        try:
-            log_response_bodies(driver, logger, 5, domain_filter=None)
-        except Exception:
-            pass
-        
-        if logger:
-            logger("步骤: 提交注册")
-        # Ensure we find the close popup
-        # Optimize: Retry loop for closing popup to ensure it is closed
-        popup_closed = False
-        
-        # Define locators: Config > User Preference > Fallback
-        popup_xpaths = [
-            xpaths.get('close_popup_svg'), # From config
-            "//svg[@xmlns='http://www.w3.org/2000/svg' and contains(@class, 'el-icon')]",
-            "//*[contains(@class, 'el-dialog__close')]"
-        ]
-        # Filter None
-        popup_xpaths = [x for x in popup_xpaths if x]
-        
-        for attempt in range(5):
-            try:
-                # 优先检查是否已经注册成功（通过URL或Toast）
-                try:
-                    curr_url = driver.current_url
-                    if "all-tools" in curr_url or "dashboard" in curr_url:
-                        if logger: logger("检测到 URL 跳转至后台，视为注册成功")
-                        popup_closed = True
-                        break
-                    
-                    # 检查 'You have signed in' 提示
-                    if element_visible(driver, "//*[contains(text(), 'You have signed in')]", 500, current_poll):
-                         if logger: logger("检测到 'You have signed in' 提示，视为注册成功")
-                         popup_closed = True
-                         break
-                    
-                    # 检查 'Sign In' 或 'Login' (注册成功后跳转登录页 - User Issue: Stuck on login page)
-                    if element_visible(driver, "//*[contains(text(), 'Sign In') or contains(text(), 'Login') or contains(text(), '登录')]", 500, current_poll):
-                         if logger: logger("检测到登录页面元素(Sign In)，视为注册成功")
-                         popup_closed = True
-                         break
-                except Exception:
-                    pass
-
-                if logger and attempt == 0: logger("检查关闭弹窗状态...")
-                
-                # Check if popup exists AND is visible
-                found_xpath = None
-                # Use a shorter timeout for checking existence (e.g., 2s)
-                # If it's not there, we assume it's closed or never appeared.
-                for xp in popup_xpaths:
-                    # Fix: Use element_visible instead of element_exists
-                    # This ensures we don't try to close a popup that is in DOM but hidden (display: none)
-                    if element_visible(driver, xp, 2000, current_poll):
-                         found_xpath = xp
-                         break
-                
-                if not found_xpath:
-                    if logger: logger("未检测到可见弹窗，视为已关闭")
-                    popup_closed = True
-                    break
-                
-                if logger: logger(f"检测到关闭弹窗 ({found_xpath})，尝试关闭 (第 {attempt+1} 次)")
-                
-                # Try explicit wait for clickable
-                try:
-                    WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.XPATH, found_xpath)))
-                except Exception:
-                    pass
-
-                # Try normal click first
-                clicked = find_click_any(driver, found_xpath, 2000, current_poll)
-                if not clicked:
-                    # Try JS click
-                    js_click_xpath(driver, found_xpath)
-                
-                time.sleep(1) # Wait for animation
-                
-                # Verify if closed
-                # Fix: Check for INVISIBILITY instead of non-existence
-                # Element UI often hides dialogs (display: none) rather than removing them from DOM
-                try:
-                    WebDriverWait(driver, 2, poll_frequency=0.2).until(
-                        EC.invisibility_of_element_located((By.XPATH, found_xpath))
-                    )
-                    if logger: logger("弹窗已成功关闭 (验证通过)")
-                    popup_closed = True
-                    break
-                except Exception:
-                    if logger: logger("弹窗关闭验证失败(仍可见)，准备重试...")
-                    
+                if element_visible(driver, "//*[contains(text(), 'registered') or contains(text(), 'used')]", 2000, current_poll):
+                    body_text = driver.find_element(By.TAG_NAME, 'body').text.lower()
+                    if "already registered" in body_text or "already used" in body_text or "account exists" in body_text:
+                        if logger: logger("检测到邮箱已被使用提示")
+                        if email_pool: email_pool.update_email_status(email, 'fail_used')
+                        raise RuntimeError('email_used_prompt')
             except Exception as e:
-                if logger: logger(f"关闭弹窗过程异常: {e}")
+                if str(e) == 'email_used_prompt': raise e
+                pass
+
+            # Slider
+            if logger: logger("步骤: 等待并通过滑块")
+            if stop_event and stop_event.is_set(): raise RuntimeError('stopped')
             
+            code_input_el_xpath = xpaths.get('code_url_element')
+            if not code_input_el_xpath: raise RuntimeError('code_input_xpath_missing')
+            
+            t_slider = time.time()
+            slider_ok = False
+            max_slider_retries = 8
+            slider_iframe_xpath = xpaths.get('slider_iframe')
+            slider_container_xpath = xpaths.get('slider_container')
+            
+            for attempt in range(max_slider_retries):
+                if stop_event and stop_event.is_set(): raise RuntimeError('stopped')
+                if attempt > 0 and logger: logger(f"Slider: 重试 {attempt+1}/{max_slider_retries}")
+                
+                if solve_slider(driver, xpaths, current_timeout, current_poll, logger=logger):
+                    slider_ok = True
+                    break
+                    
+                if attempt < max_slider_retries - 1:
+                    try:
+                        try: driver.switch_to.default_content()
+                        except: pass
+                        t_wait = time.time()
+                        while time.time() - t_wait < 6:
+                            if stop_event and stop_event.is_set(): raise RuntimeError('stopped')
+                            if element_visible(driver, code_input_el_xpath, 400, current_poll): break
+                            if (slider_iframe_xpath and element_visible(driver, slider_iframe_xpath, 400, current_poll)) or (slider_container_xpath and element_visible(driver, slider_container_xpath, 400, current_poll)): break
+                            time.sleep(0.3)
+                    except: pass
+                    
+            if not slider_ok: raise RuntimeError('slider_failed')
+            if logger: logger(f"步骤: 滑块通过 (耗时 {time.time()-t_slider:.2f}s)")
+            
+            if logger: logger("步骤: 滑块通过，强制等待 5 秒...")
+            time.sleep(1)
+            if logger: logger("步骤: 滑块通过，立即跳转接码页等待验证码")
+
+        # ---------------------------------------------------------------------
+        # Step 3: Confirm & Submit (确认)
+        # ---------------------------------------------------------------------
+        def step_confirm():
+            driver = ctx['driver']
+            
+            if stop_event and stop_event.is_set(): raise RuntimeError('stopped')
+            if target_check and target_check():
+                if logger: logger("终止接码：已达到目标注册数量")
+                raise RuntimeError('target_reached')
+                
+            default_resend_xp = "//a[contains(text(), 'Resend Code') or contains(text(), '重新发送') or contains(text(), '再发一条')]"
+            resend_xp = xpaths.get('resend_code') or default_resend_xp
+            
+            # Prepare Credentials
+            auth_code_val = row.get('auth_code') or row.get('授权码') or row.get('authCode') or row.get('code_url')
+            pwd_val = row.get('password') or row.get('密码')
+            password_for_imap = str(auth_code_val or pwd_val or '').strip()
+            
+            if not password_for_imap:
+                 if logger: logger("❌ 错误: 缺少密码/授权码，无法获取验证码。")
+                 raise RuntimeError('missing_credentials')
+
+            # Determine Mode
+            auth_code_or_url = str(row.get('auth_code') or row.get('授权码') or '').strip()
+            extraction_mode = 'imap'
+            extraction_url = None
+            if auth_code_or_url.startswith('http'):
+                extraction_mode = 'http'
+                extraction_url = auth_code_or_url
+                
+            # Proxy for IMAP
+            proxy_config = None
+            if host and port:
+                 try:
+                    ptype = socks.SOCKS5
+                    if protocol.lower() == 'http': ptype = socks.HTTP
+                    elif protocol.lower() == 'socks4': ptype = socks.SOCKS4
+                    proxy_config = {'proxy_type': ptype, 'addr': host, 'port': int(port), 'username': proxy_username, 'password': proxy_password, 'rdns': True}
+                 except: pass
+
+            if logger: logger("使用 Unified Captcha 模式获取验证码...")
+            code = extract_verification_code_unified(
+                driver, email, password_for_imap, resend_xp, logger, 
+                timeout=400, proxy_config=proxy_config, stop_event=stop_event,
+                extraction_mode=extraction_mode, extraction_url=extraction_url
+            )
+            
+            if not code:
+                if logger: logger("步骤: 获取验证码失败(超时)")
+                # Diagnosis
+                slider_iframe_xpath = xpaths.get('slider_iframe')
+                slider_container_xpath = xpaths.get('slider_container')
+                try:
+                    if (slider_iframe_xpath and element_visible(driver, slider_iframe_xpath, 1000, current_poll)) or \
+                       (slider_container_xpath and element_visible(driver, slider_container_xpath, 1000, current_poll)):
+                        if logger: logger("诊断: 滑块验证框重新出现，判定为滑块实际上未通过")
+                        raise RuntimeError('slider_reappeared')
+                except Exception as e:
+                     if str(e) == 'slider_reappeared': raise e
+                raise RuntimeError('code_not_found')
+
+            ctx['gate_state'] = 'code_received'
+            if logger: logger("步骤: 获取验证码成功，已切回主窗口")
+            
+            try: driver.switch_to.default_content()
+            except: pass
+            
+            # Fill Code
+            try:
+                t0 = time.time()
+                if logger: logger("正在等待验证码输入框...")
+                code_input_el_xpath = xpaths.get('code_url_element')
+                input_locators = [
+                    code_input_el_xpath,
+                    "//input[@autocomplete='one-time-code']",
+                    "//input[contains(@placeholder, 'verification') or contains(@placeholder, 'code') or contains(@placeholder, '验证码')]",
+                    "//input[@type='text' and string-length(@maxlength)='6']"
+                ]
+                input_locators = list(dict.fromkeys([x for x in input_locators if x]))
+                
+                found_input_xpath = None
+                for xp in input_locators:
+                     try:
+                         if element_visible(driver, xp, 1000, current_poll):
+                             found_input_xpath = xp
+                             break
+                     except: pass
+                
+                if not found_input_xpath:
+                    end_find = time.time() + 10
+                    while time.time() < end_find:
+                        for xp in input_locators:
+                            try:
+                                if element_visible(driver, xp, 500, current_poll):
+                                    found_input_xpath = xp
+                                    break
+                            except: pass
+                        if found_input_xpath: break
+                        time.sleep(1)
+
+                if not found_input_xpath:
+                    if logger: logger("验证码输入框未出现(超时)")
+                    raise RuntimeError('code_input_not_visible')
+
+                if logger: logger(f"验证码输入框就绪: {found_input_xpath} (耗时 {time.time()-t0:.2f}s)")
+                el = driver.find_element(By.XPATH, found_input_xpath)
+                el.clear()
+                el.send_keys(code)
+            except Exception as e:
+                if logger: logger("验证码填写异常")
+                raise RuntimeError('code_input_error')
+
+            if logger: logger("步骤: 填写验证码")
+            find_click_any(driver, xpaths['final_submit_btn'], current_timeout, current_poll)
+            
+            if logger: logger("提交后强制等待 1 秒...")
             time.sleep(1)
 
-        result_ok = True # Default to True as per "submit clicked" logic
-        
-        if popup_closed:
-            if logger: logger("注册判定成功，开始执行状态持久化流程")
+            # 注册跳转流程重定义 (User Request 2)
+            if logger: logger("步骤: 提交注册")
+            if logger: logger("步骤: 等待URL跳转 (成功标志)...")
+            
+            jump_success = False
             try:
-                c = driver.get_cookies()
-                if logger: logger(f"当前会话Cookies数量: {len(c)}")
+                success_keywords = ['dashboard', 'all-tools', 'home', 'portal', 'success']
+                def check_url_jump(d):
+                    u = d.current_url.lower()
+                    if any(k in u for k in success_keywords): return True
+                    return False
+                WebDriverWait(driver, 15).until(check_url_jump)
+                jump_success = True
+                if logger: logger(f"检测到URL跳转成功: {driver.current_url}")
             except Exception as e:
-                if logger: logger(f"读取Cookies失败: {e}")
-            max_wait = 8
-            start_ts = time.time()
-            last_count = -1
-            stable = 0
-            while time.time() - start_ts < max_wait:
+                if logger: logger(f"等待URL跳转超时或失败: {e}")
                 try:
-                    c = driver.get_cookies()
-                    cnt = len(c) if c else 0
-                    dc = driver.execute_script("return document.cookie||''")
-                    ok = (cnt > 0) or (dc is not None and len(dc) > 0)
-                    if ok:
-                        # 优化: 如果有 cookies，不需要等 8 秒，只要稳定（或直接）即可
-                        # User Request: "如果是的话 当出现“当前会话Cookies数量: 12”>0就可以立即关闭窗口"
-                        if cnt > 0:
-                            if logger: logger(f"检测到 Cookies ({cnt})，立即结束持久化等待")
-                            break
-                        
-                        if cnt == last_count:
-                            stable += 1
-                            if stable >= 2:
-                                break
-                        else:
-                            stable = 0
-                        last_count = cnt
-                except Exception:
-                    pass
-                time.sleep(1)
-            try:
-                u = driver.current_url
-                if "login" in u.lower() and "dashboard" not in u.lower():
-                    if logger: logger("持久化等待后检测到URL包含login，可能登录状态已丢失")
-                else:
-                    if logger: logger("状态检查通过，Profile应已保存")
-            except Exception:
-                pass
+                     body_text = driver.find_element(By.TAG_NAME, 'body').text
+                     if "You have signed in" in body_text or "dashboard" in body_text.lower():
+                         if logger: logger("通过页面内容检测到注册成功")
+                         jump_success = True
+                except: pass
 
-             # Strict Email Status Update: Only mark as submitted AFTER successful popup close
+            if not jump_success:
+                raise RuntimeError('url_jump_failed')
+
+            if logger: logger("步骤: 跳转成功，强制等待 3 秒...")
+            time.sleep(3)
+
             if email_pool:
                 try:
                     email_pool.update_email_status(email, 'submitted')
-                    if logger: logger(f"邮箱 {email} 已标记为 submitted (注册流程完成)")
+                    if logger: logger(f"邮箱 {email} 已标记为 submitted (注册成功)")
                 except Exception as e:
                     if logger: logger(f"标记邮箱状态失败: {e}")
-            
+
+        # ---------------------------------------------------------------------
+        # Execution
+        # ---------------------------------------------------------------------
+        result_ok = False
+        try:
+            runner.run("1. 验证与初始化", step_verify)
+            runner.run("2. 填写表单与滑块", step_write)
+            runner.run("3. 确认提交与验证", step_confirm)
+            result_ok = True
             return True, 'success'
-        else:
-            if logger:
-                logger("步骤: 未找到关闭弹窗按钮或关闭超时，但提交按钮已点击，视为成功")
-            if logger: logger("等待持久化以尝试保存可能的状态")
-            try:
-                c = driver.get_cookies()
-                if logger: logger(f"当前会话Cookies数量: {len(c)}")
-            except Exception as e:
-                if logger: logger(f"读取Cookies失败: {e}")
-            max_wait = 8
-            start_ts = time.time()
-            last_count = -1
-            stable = 0
-            while time.time() - start_ts < max_wait:
-                try:
-                    c = driver.get_cookies()
-                    cnt = len(c) if c else 0
-                    dc = driver.execute_script("return document.cookie||''")
-                    ok = (cnt > 0) or (dc is not None and len(dc) > 0)
-                    if ok:
-                        # 优化: 如果有 cookies，不需要等 8 秒，只要稳定（或直接）即可
-                        if cnt > 0:
-                            if logger: logger(f"检测到 Cookies ({cnt})，立即结束持久化等待")
-                            break
-
-                        if cnt == last_count:
-                            stable += 1
-                            if stable >= 2:
-                                break
-                        else:
-                            stable = 0
-                        last_count = cnt
-                except Exception:
-                    pass
-                time.sleep(1)
+        except Exception as e:
+            result_ok = False
+            fail_reason = str(e)
+            if logger: logger(f"任务执行失败: {fail_reason}")
+            return False, fail_reason
             
-            # 即使未找到弹窗，也标记为成功，因为"final_submit_btn"已经点击
-            # User Request: "Correct to: Fill Email -> Click Submit -> Mark on Success"
-            # Since we treat "Submit Clicked" as Success (even if popup fails), we mark it here.
-            if email_pool:
-                try:
-                    email_pool.update_email_status(email, 'submitted')
-                    if logger: logger(f"邮箱 {email} 已标记为 submitted (强制成功)")
-                except Exception as e:
-                    if logger: logger(f"标记邮箱状态失败: {e}")
+        finally:
+            driver = ctx.get('driver')
+            browser_id = ctx.get('browser_id')
+            gate_state = ctx.get('gate_state')
+            t_attached = ctx.get('t_attached')
             
-            return True, '成功(弹窗未关闭)'
+            # Rollback
+            if not result_ok and email_pool:
+                try:
+                    email_pool.update_email_status(email, 'failed')
+                    if logger: logger(f"邮箱 {email} 已标记为 failed (注册未完成)")
+                except: pass
 
-    except Exception as e:
-        result_ok = False # Mark as failed for exception
-        return False, str(e)
-    finally:
-        # Rollback Mechanism: If not successful, reset email status if needed
-        if not result_ok and email_pool:
+            if logger: logger(f"正在清理资源: {browser_id}")
+            
+            elapsed = time.time() - t_attached if t_attached else 0
+            early_failure = (not result_ok) and (gate_state in ('attached', 'pre_open_more_tools', 'tab_switched'))
+            is_stopped = stop_event and stop_event.is_set()
+            hold_close = (not result_ok) and (not is_stopped) and ((elapsed < (keep_open_on_failure_ms / 1000.0)) or (allow_hold_on_early_failure and early_failure))
+            
+            if hold_close and logger:
+                if allow_hold_on_early_failure and early_failure: logger("因早期失败，保持窗口并等待后续重试")
+                else: logger(f"因失败且未达到最小保持时间({keep_open_on_failure_ms}ms)，暂不关闭窗口")
+            
             try:
-                # Update status to 'failed' so it can be distinguished from 'new'
-                # Use a specific failure reason if available in future, but 'failed' is good for now
-                email_pool.update_email_status(email, 'failed')
-                if logger: logger(f"邮箱 {email} 已标记为 failed (注册未完成)")
+                if driver and not hold_close:
+                    try: driver.execute_script("try{document.activeElement && document.activeElement.blur();}catch(e){}")
+                    except: pass
+                    try: driver.get("about:blank")
+                    except: pass
+                    
+                    def _quit_driver():
+                        try: driver.quit()
+                        except: pass
+                    t_quit = threading.Thread(target=_quit_driver)
+                    t_quit.start()
+                    t_quit.join(timeout=3.0)
             except Exception as e:
-                if logger: logger(f"重置邮箱状态失败: {e}")
+                if logger: logger(f"driver.quit error: {e}")
 
-        if logger:
-             logger(f"正在清理资源: {browser_id}")
-        
-        elapsed = time.time() - t_attached if 't_attached' in locals() else 0
-        early_failure = (not result_ok) and (gate_state in ('attached', 'pre_open_more_tools', 'tab_switched'))
-        is_stopped = stop_event and stop_event.is_set()
-        hold_close = (not result_ok) and (not is_stopped) and ((elapsed < (keep_open_on_failure_ms / 1000.0)) or (allow_hold_on_early_failure and early_failure))
-        if hold_close and logger:
-            if allow_hold_on_early_failure and early_failure:
-                logger("因早期失败，保持窗口并等待后续重试")
-            else:
-                logger(f"因失败且未达到最小保持时间({keep_open_on_failure_ms}ms)，暂不关闭窗口")
-        
-        # 优先使用 driver.quit() 关闭窗口，这通常比 API 更干净
-        # 优化: 使用线程超时机制防止 driver.quit() 卡死 (User Issue: Window stays open)
-        try:
-            if driver and not hold_close:
-                try:
-                    driver.execute_script("try{document.activeElement && document.activeElement.blur();}catch(e){}")
-                except Exception:
-                    pass
-                try:
-                    driver.get("about:blank")
-                except Exception:
-                    pass
-                def _quit_driver():
+            try:
+                if browser_id and not hold_close:
+                    try: client.close_browser(browser_id)
+                    except: pass
+            except: pass
+
+            if browser_id and not result_ok:
+                if logger: logger(f"任务失败，正在删除窗口: {browser_id}")
+                for _ in range(3):
                     try:
-                        driver.quit()
-                    except:
-                        pass
-                
-                t_quit = threading.Thread(target=_quit_driver)
-                t_quit.start()
-                t_quit.join(timeout=3.0) # 最多等待3秒
-                
-                if t_quit.is_alive():
-                     if logger: logger("driver.quit() 超时，跳过并直接调用API关闭")
-                elif logger:
-                     logger("driver.quit() 执行完成")
-
-        except Exception as e:
-            if logger: logger(f"driver.quit error: {e}")
-
-        try:
-            if browser_id and not hold_close:
-                if result_ok:
-                    if logger: logger("注册成功，准备关闭窗口")
-                # 无论 driver.quit 是否成功，都尝试调用 close_browser
-                try:
-                    client.close_browser(browser_id)
-                    if logger: logger(f"已请求关闭浏览器API: {browser_id}")
-                except Exception as close_err:
-                    if logger: logger(f"close_browser warning: {close_err}")
-        except Exception as e:
-            if logger: logger(f"close_browser error: {e}")
-
-        # 必须删除未成功的窗口
-        if browser_id and not result_ok:
-            if logger:
-                logger(f"任务失败，正在删除窗口: {browser_id}")
-            # time.sleep(2)
-            for _ in range(3):
-                try:
-                    client.delete_browser(browser_id)
-                    if logger:
-                        logger(f"已删除失败窗口: {browser_id}")
-                    break
-                except Exception as del_err:
-                    if logger:
-                        logger(f"删除窗口失败(重试): {del_err}")
-                    time.sleep(2.0)
+                        client.delete_browser(browser_id)
+                        if logger: logger(f"已删除失败窗口: {browser_id}")
+                        break
+                    except: time.sleep(2.0)
 
 
 def run_batch(

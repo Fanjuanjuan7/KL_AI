@@ -1,0 +1,122 @@
+[
+  {
+    "domain": ".klingai.com",
+    "expiry": 1804054011,
+    "httpOnly": false,
+    "name": "_uetvid",
+    "path": "/",
+    "sameSite": "Lax",
+    "secure": false,
+    "value": "07bba750032211f1a7dbb9e6e7ba3368"
+  },
+  {
+    "domain": ".klingai.com",
+    "expiry": 1772172440,
+    "httpOnly": false,
+    "name": "userId",
+    "path": "/",
+    "sameSite": "None",
+    "secure": true,
+    "value": "63450223"
+  },
+  {
+    "domain": ".klingai.com",
+    "expiry": 1770444411,
+    "httpOnly": false,
+    "name": "_uetsid",
+    "path": "/",
+    "sameSite": "Lax",
+    "secure": false,
+    "value": "07bb7260032211f1bd46693111828e68"
+  },
+  {
+    "domain": ".klingai.com",
+    "expiry": 1804918010,
+    "httpOnly": false,
+    "name": "_ga_MWG30LDQKZ",
+    "path": "/",
+    "sameSite": "Lax",
+    "secure": false,
+    "value": "GS2.1.s1770357997$o1$g1$t1770358010$j47$l0$h30894337"
+  },
+  {
+    "domain": "app.klingai.com",
+    "expiry": 1785910007,
+    "httpOnly": false,
+    "name": "g_state",
+    "path": "/",
+    "sameSite": "Lax",
+    "secure": false,
+    "value": "{\"i_l\":0,\"i_ll\":1770358007880,\"i_b\":\"ubqlFjvSn0QQQHYLoktG6676cVjbr/0ReiajcKyJ2zY\",\"i_e\":{\"enable_itp_optimization\":0}}"
+  },
+  {
+    "domain": ".klingai.com",
+    "expiry": 1804917998,
+    "httpOnly": false,
+    "name": "did",
+    "path": "/",
+    "sameSite": "None",
+    "secure": true,
+    "value": "web_85adec59b88e534235f104df3a9219b9430f"
+  },
+  {
+    "domain": ".klingai.com",
+    "expiry": 1804918010,
+    "httpOnly": false,
+    "name": "_ga",
+    "path": "/",
+    "sameSite": "Lax",
+    "secure": false,
+    "value": "GA1.1.1423949324.1770357997"
+  },
+  {
+    "domain": ".klingai.com",
+    "expiry": 1778133997,
+    "httpOnly": false,
+    "name": "_gcl_au",
+    "path": "/",
+    "sameSite": "Lax",
+    "secure": false,
+    "value": "1.1.1789672549.1770357997"
+  },
+  {
+    "domain": ".klingai.com",
+    "expiry": 1804917995,
+    "httpOnly": false,
+    "name": "__risk_web_device_id",
+    "path": "/",
+    "sameSite": "Lax",
+    "secure": false,
+    "value": "484e704e1770357995014701"
+  },
+  {
+    "domain": ".klingai.com",
+    "expiry": 1772950007,
+    "httpOnly": false,
+    "name": "KLING_LAST_ACCESS_REGION",
+    "path": "/",
+    "sameSite": "Lax",
+    "secure": false,
+    "value": "global"
+  },
+  {
+    "domain": "app.klingai.com",
+    "expiry": 1785909997,
+    "httpOnly": false,
+    "name": "kGateway-identity",
+    "path": "/global",
+    "sameSite": "Lax",
+    "secure": false,
+    "value": "kGateway-0657da96-41689411"
+  },
+  {
+    "domain": ".klingai.com",
+    "expiry": 1796278007,
+    "httpOnly": false,
+    "name": "accept-language",
+    "path": "/",
+    "sameSite": "Lax",
+    "secure": false,
+    "value": "en-001"
+  }
+]

@@ -89,6 +89,19 @@ class EmailPool:
                 except:
                     pass
 
+    def is_email_valid(self, email: str) -> bool:
+        """Check if an email is valid for registration."""
+        with self._lock:
+            for item in self.emails:
+                if item['email'] == email:
+                    status = item.get('status', 'new').lower()
+                    # User requested explicit rejection for "invalid" or "disabled" status
+                    # We treat 'disabled', 'invalid', 'banned' as invalid
+                    if status in ('disabled', 'invalid', 'banned'):
+                        return False
+                    return True
+        return False # Email not found is also invalid for our pool
+
     def update_email_status(self, email: str, status: str):
         """Update status for an email and save."""
         dirty = False
@@ -118,6 +131,8 @@ class EmailPool:
                     
                     if status in ('success', 'registered', 'submitted'):
                          return False, f"状态为 {status}"
+                    if status in ('disabled', 'invalid', 'banned'):
+                         return False, "该邮箱已被禁用"
                     if status == 'processing':
                          return False, "正在处理中"
                     # For 'failed' or 'stopped', we generally allow retry unless explicitly filtered elsewhere.

@@ -931,7 +931,7 @@ class App(*BaseClasses):
         ctk.CTkButton(tool_frame, text="清空邮箱", command=self.clear_emails_dialog, fg_color="#ff4d4d", hover_color="#d63030").pack(side='right', padx=6)
         
         # Legend
-        ctk.CTkLabel(tool_frame, text="图例: 🟩 未用 🟥 已用", font=("Arial", 12)).pack(side='right', padx=10)
+        ctk.CTkLabel(tool_frame, text="图例: ✅ 可用  🏁 已用  ❌ 无效  ⏳ 进行中  ⚠️ 失败", font=("Arial", 12)).pack(side='right', padx=10)
 
         # Search Bar
         search_frame = ctk.CTkFrame(parent)
@@ -965,8 +965,11 @@ class App(*BaseClasses):
         self.email_tree.column("status", width=80)
         
         # Configure tags for colors
-        self.email_tree.tag_configure('used', foreground='#FF0000')   # Red
-        self.email_tree.tag_configure('unused', foreground='#00FF00') # Green
+        self.email_tree.tag_configure('unused', foreground='#00AA00')  # Green (Available)
+        self.email_tree.tag_configure('used', foreground='#808080')    # Grey (Registered/Used)
+        self.email_tree.tag_configure('invalid', foreground='#FF0000') # Red (Invalid/Banned)
+        self.email_tree.tag_configure('processing', foreground='#0000FF') # Blue (Processing)
+        self.email_tree.tag_configure('failed', foreground='#FFA500')  # Orange (Failed)
         
         # Bind double click for links
         self.email_tree.bind('<Double-1>', self.on_tree_double_click)
@@ -1310,16 +1313,28 @@ class App(*BaseClasses):
                 continue
             
             # Status Logic: Source of truth is email_pool status
-            status_val = e.get('status', 'new')
-            # "new" or empty string means Unused. Everything else is Used.
-            is_used = status_val not in ("new", "")
+            status_val = e.get('status', 'new').lower()
             
-            if is_used:
-                status = "已用"
-                tags = ('used',)
-            else:
-                status = "可用"
+            # Map status to display text and tags
+            if status_val in ('new', ''):
+                status = "✅ 可用"
                 tags = ('unused',)
+            elif status_val in ('success', 'registered', 'submitted', 'used'):
+                status = "🏁 已用"
+                tags = ('used',)
+            elif status_val in ('disabled', 'invalid', 'banned'):
+                status = "❌ 无效"
+                tags = ('invalid',)
+            elif status_val == 'processing':
+                status = "⏳ 进行中"
+                tags = ('processing',)
+            elif status_val in ('failed', 'error', 'stopped'):
+                status = "⚠️ 失败"
+                tags = ('failed',)
+            else:
+                # Fallback for unknown statuses
+                status = f"❓ {status_val}"
+                tags = ('used',) # Default to 'used' look for unknowns
             
             # Mask auth code if encrypted
             auth = e.get('auth_code', '')
@@ -1512,11 +1527,19 @@ class App(*BaseClasses):
         current_mode = self.email_mode_var.get()
         
         for e in emails:
-            if e['email'] in used_emails:
+            email_addr = e.get('email', '')
+            if not email_addr:
+                continue
+                
+            if email_addr in used_emails:
                 continue
             
-            # Also check status in pool
-            if e.get('status') in ('success', 'registered', 'used', 'submitted'):
+            # Check availability via EmailPool (includes status checks for disabled/invalid/banned)
+            # User Request 1: Real-time validation & "该邮箱已被禁用" error
+            is_avail, reason = self.email_pool.check_email_availability(email_addr)
+            if not is_avail:
+                if reason == "该邮箱已被禁用":
+                     self.append_log(f"跳过无效邮箱: {email_addr} ({reason})")
                 continue
             
             # Filter by Mode
