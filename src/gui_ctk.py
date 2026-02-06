@@ -99,6 +99,9 @@ class App(*BaseClasses):
         # EmailPool stores config in config/email_pool.csv
         self.email_pool = EmailPool(os.path.join(self.project_root, 'config', 'email_pool.csv'))
         
+        # Email Registration Mode
+        self.email_mode_var = tkinter.StringVar(value="IMAP模式")
+        
         # Register Listeners for Real-time Updates
         # Update Email List UI when pool changes
         self.email_pool.add_listener(lambda: self._run_on_ui(self._update_email_list_ui))
@@ -165,7 +168,8 @@ class App(*BaseClasses):
         for var in [self.xpath_var, self.bit_url_var, self.bit_secret_var, self.platform_url_var,
                    self.concurrent_var, self.timeout_ms_var, self.poll_ms_var,
                    self.build_output_var, self.ip_def_port_var, self.ip_def_user_var, self.ip_def_pass_var, 
-                   self.ip_def_protocol_var, self.ip_config_path_var, self.config_path_var, self.udp_var]:
+                   self.ip_def_protocol_var, self.ip_config_path_var, self.config_path_var, self.udp_var,
+                   self.email_mode_var, self.target_reg_count_var]:
             var.trace_add('write', lambda *args: self._schedule_save_config())
 
         self._build_ui()
@@ -910,6 +914,13 @@ class App(*BaseClasses):
         tool_frame = ctk.CTkFrame(parent)
         tool_frame.pack(fill='x', padx=12, pady=8)
         
+        # Mode Selector
+        ctk.CTkLabel(tool_frame, text="当前模式:").pack(side='left', padx=(10, 2))
+        self.mode_combo = ctk.CTkComboBox(tool_frame, values=["IMAP模式", "心蓝模式"], 
+                                          variable=self.email_mode_var, 
+                                          command=self.on_mode_change, width=110)
+        self.mode_combo.pack(side='left', padx=2)
+        
         ctk.CTkButton(tool_frame, text="导入账号 (TXT/CSV)", command=self.import_emails_dialog).pack(side='left', padx=6)
         ctk.CTkButton(tool_frame, text="粘贴导入 (自动生成URL)", command=self.paste_import_emails_dialog).pack(side='left', padx=6)
         # ctk.CTkButton(tool_frame, text="导出为注册任务CSV", command=self.export_emails_to_csv).pack(side='left', padx=6) # Removed
@@ -1097,9 +1108,10 @@ class App(*BaseClasses):
                      self._ip_low_warned = False
             
             # Email Stats
-            email_stats = self.email_pool.get_stats()
+            current_mode = self.email_mode_var.get() if hasattr(self, 'email_mode_var') else None
+            email_stats = self.email_pool.get_stats(mode_filter=current_mode)
             total_emails = email_stats.get('total_emails', 0)
-            used_emails = email_stats.get('used_emails', 0) # This comes from email status now
+            used_emails = email_stats.get('used_emails', 0)
             # Note: The 'used_emails_count' from ip_stats is different (emails used by IPs). 
             # The user wants "used emails" in Email Pool tab, which is based on email status.
             
@@ -1259,6 +1271,12 @@ class App(*BaseClasses):
         self.trigger_refresh(force=True)
         self.append_log("视图已刷新 (数据状态保持不变)")
 
+    def on_mode_change(self, choice):
+        self.append_log(f"切换至注册模式: {choice}")
+        self._update_email_list_ui()
+        # Immediately refresh stats to reflect the new mode
+        self.trigger_refresh(force=True)
+
     def _update_email_list_ui(self):
         # Clear
         for item in self.email_tree.get_children():
@@ -1279,6 +1297,16 @@ class App(*BaseClasses):
                 break
                 
             if query and query not in e['email'].lower():
+                continue
+            
+            # Filter by Mode
+            auth_chk = e.get('auth_code', '')
+            is_xinlan = auth_chk.startswith('http')
+            current_mode = self.email_mode_var.get()
+            
+            if current_mode == "心蓝模式" and not is_xinlan:
+                continue
+            if current_mode == "IMAP模式" and is_xinlan:
                 continue
             
             # Status Logic: Source of truth is email_pool status
@@ -1348,7 +1376,7 @@ class App(*BaseClasses):
             vals = self.email_tree.item(item)['values']
             if vals:
                 email = vals[0]
-                self.email_pool.update_email_status(email, status)
+                self.email_pool.update_status(email, status)
                 count += 1
         
         if count > 0:
@@ -1443,12 +1471,14 @@ class App(*BaseClasses):
             vals = self.email_tree.item(item)['values']
             if vals:
                 email = vals[0] # email is first column
-                self.email_pool.mark_invalid(email)
+                self.email_pool.delete_email(email)
                 count += 1
         
         self._update_email_list_ui()
         self.refresh_home_stats()
-        self.append_log(f"已删除 {count} 个邮箱")
+        msg = f"已成功删除 {count} 个邮箱"
+        self.append_log(msg)
+        messagebox.showinfo("删除成功", msg)
 
     def start_registration(self):
         if self.worker and self.worker.is_alive():
@@ -1479,10 +1509,25 @@ class App(*BaseClasses):
         emails = self.email_pool.get_all_rows()
         used_emails = self.ip_manager.get_used_emails()
         valid_rows = []
+        current_mode = self.email_mode_var.get()
         
         for e in emails:
             if e['email'] in used_emails:
                 continue
+            
+            # Also check status in pool
+            if e.get('status') in ('success', 'registered', 'used', 'submitted'):
+                continue
+            
+            # Filter by Mode
+            auth_chk = e.get('auth_code', '')
+            is_xinlan = auth_chk.startswith('http')
+            
+            if current_mode == "心蓝模式" and not is_xinlan:
+                continue
+            if current_mode == "IMAP模式" and is_xinlan:
+                continue
+
             valid_rows.append([e['email'], e.get('password',''), e.get('auth_code','')])
             
         if not valid_rows:
@@ -1675,7 +1720,9 @@ class App(*BaseClasses):
             'ip_def_pass': self.ip_def_pass_var.get(),
             'ip_def_protocol': self.ip_def_protocol_var.get(),
             'ip_config_path': make_rel(self.ip_config_path_var.get()),
-            'udp_enabled': self.udp_var.get()
+            'udp_enabled': self.udp_var.get(),
+            'email_mode': self.email_mode_var.get(),
+            'target_reg_count': self.target_reg_count_var.get()
         }
         try:
             with open(self.config_path_var.get(), 'w', encoding='utf-8') as f:
@@ -1746,6 +1793,8 @@ class App(*BaseClasses):
             self.ip_def_pass_var.set(cfg.get('ip_def_pass', ''))
             self.ip_def_protocol_var.set(cfg.get('ip_def_protocol', 'socks5'))
             self.udp_var.set(cfg.get('udp_enabled', False))
+            self.email_mode_var.set(cfg.get('email_mode', 'IMAP模式'))
+            self.target_reg_count_var.set(cfg.get('target_reg_count', '10'))
             
             # IP Config Path
             ip_conf_path = recover_path(cfg.get('ip_config_path'), 'config/ip_pool.json', "IP池配置")
@@ -1821,6 +1870,7 @@ class App(*BaseClasses):
         def _do_quit():
             try:
                 self.append_log("程序正在退出...")
+                self.save_config() # Ensure config is saved before exit
                 self.stop_registration()
                 self.quit()
                 self.destroy()

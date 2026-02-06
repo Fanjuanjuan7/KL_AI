@@ -131,21 +131,56 @@ class EmailPool:
         avail, _ = self.check_email_availability(email)
         return not avail
 
-    def get_stats(self) -> Dict[str, int]:
+    def get_stats(self, mode_filter: str = None) -> Dict[str, int]:
         with self._lock:
-            total = len(self.emails)
-            # Used = success, registered, submitted.
-            # Processing is temporary used.
-            # Failed/Stopped/New are technically 'available' for next run, but failed/stopped might need manual reset?
-            # User wants "Used" vs "Unused".
-            # Unused = Total - Used.
-            # If we count 'failed' as used, they can't be reused.
-            # Let's define 'used' as completed (success/registered/submitted).
-            used = sum(1 for e in self.emails if e.get('status', 'new') in ('success', 'registered', 'submitted'))
+            # Filter emails based on mode if provided
+            if mode_filter == "心蓝模式":
+                # XinLan: auth_code starts with http
+                target_emails = [e for e in self.emails if e.get('auth_code', '').startswith('http')]
+            elif mode_filter == "IMAP模式":
+                # IMAP: auth_code does NOT start with http
+                target_emails = [e for e in self.emails if not e.get('auth_code', '').startswith('http')]
+            else:
+                target_emails = self.emails
+
+            total = len(target_emails)
+            # Used = success, registered, submitted, used.
+            used = sum(1 for e in target_emails if e.get('status', 'new') in ('success', 'registered', 'submitted', 'used'))
         return {
             'total_emails': total,
             'used_emails': used
         }
+
+    def delete_email(self, email: str) -> bool:
+        """Delete an email from the pool."""
+        deleted = False
+        with self._lock:
+            initial_len = len(self.emails)
+            self.emails = [e for e in self.emails if e['email'] != email]
+            if len(self.emails) < initial_len:
+                deleted = True
+                self._save_pool()
+        
+        if deleted:
+            self._notify_listeners()
+        return deleted
+
+    def update_status(self, email: str, status: str) -> bool:
+        """Update status of an email."""
+        updated = False
+        with self._lock:
+            for e in self.emails:
+                if e['email'] == email:
+                    if e.get('status') != status:
+                        e['status'] = status
+                        updated = True
+                    break
+            if updated:
+                self._save_pool()
+        
+        if updated:
+            self._notify_listeners()
+        return updated
 
     def get_email_config(self, email: str) -> Optional[Dict[str, str]]:
         with self._lock:
@@ -154,19 +189,22 @@ class EmailPool:
                     return item
         return None
 
+    XINLAN_DEFAULT_PASSWORD = "Juan123123."
+
     def import_emails(self, content: str, overwrite: bool = True) -> int:
         """
         Import emails from string content.
-        Format: email----password----auth_code
-        or legacy: email password auth_code
+        Supported Formats:
+        1. IMAP (3-col): Email----Password----AuthCode
+        2. XinLan (2-col): Email----URL (Password defaults to 'Juan123123.')
+        3. XinLan (3-col): Email----Password----URL
+        4. Legacy: Email Password AuthCode (Space/Tab separated)
         """
         count = 0
         lines = content.splitlines()
         
         with self._lock:
             if overwrite:
-                # If overwrite is True, we might want to clear existing or merge.
-                # Based on user intent "overwrite existing status", we'll upsert.
                 pass
 
             for line in lines:
@@ -174,14 +212,38 @@ class EmailPool:
                 if not line or line.startswith('#'):
                     continue
                 
+                # Default values
+                email = ""
+                password = ""
+                auth_code = ""
+
                 # Try ---- split first
                 if '----' in line:
                     parts = line.split('----')
                     email = parts[0].strip()
-                    password = parts[1].strip() if len(parts) > 1 else ""
-                    auth_code = parts[2].strip() if len(parts) > 2 else password
+                    
+                    # Logic to distinguish modes based on content
+                    if len(parts) >= 2:
+                        part2 = parts[1].strip()
+                        # Case 1: XinLan 2-col (Email----URL)
+                        if part2.startswith('http'):
+                            password = self.XINLAN_DEFAULT_PASSWORD
+                            auth_code = part2
+                        else:
+                            # Standard/IMAP or XinLan 3-col
+                            password = part2
+                            if len(parts) >= 3:
+                                part3 = parts[2].strip()
+                                # Case 2: XinLan 3-col (Email----Password----URL)
+                                # Case 3: IMAP 3-col (Email----Password----AuthCode)
+                                # In both cases, part3 is stored as auth_code.
+                                # Downstream logic (in register_kling_bitbrowser.py) will check if it starts with 'http'
+                                auth_code = part3
+                            else:
+                                # Fallback: IMAP 2-col (Email----Password) -> AuthCode = Password
+                                auth_code = password
                 else:
-                    # Try space/tab split
+                    # Try space/tab split (Legacy)
                     parts = line.replace('\t', ' ').split()
                     if not parts: continue
                     email = parts[0].strip()

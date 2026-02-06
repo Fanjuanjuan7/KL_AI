@@ -882,27 +882,66 @@ def extract_code_using_xpath(driver: webdriver.Remote, xpath: str) -> Optional[s
     return None
 
 
-def wait_extract_code(driver: webdriver.Remote, xpath: Optional[str], max_wait_sec: int = 20, logger: Optional[Any] = None) -> Optional[str]:
+# XinLan Mode: HTTP Verification Code Extraction
+import requests
+import re
+
+def extract_code_from_url(url: str, logger: Optional[Any] = None) -> Optional[str]:
+    """
+    Extract verification code from a given URL (XinLan Mode).
+    """
+    try:
+        # Use a real user-agent to avoid basic blocking
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            content = resp.text
+            # Use strict 6-digit regex as per user requirement: "连续6位数字"
+            # And also per user request: "使用正则表达式提取网页中的连续6位数字验证码"
+            codes = re.findall(r'\b\d{6}\b', content)
+            if codes:
+                # Return the last one found as it's likely the newest one if multiple exist
+                # Or first? Usually pages show latest at top or it's a dedicated page.
+                # Let's return the first one for now.
+                return codes[0] 
+    except Exception as e:
+        if logger: logger(f"HTTP Code Extraction Failed: {e}")
+    return None
+
+def wait_extract_code(driver: webdriver.Remote, xpath: Optional[str], max_wait_sec: int = 20, logger: Optional[Any] = None, extraction_mode: str = 'imap', extraction_url: str = None) -> Optional[str]:
     end = time.time() + max_wait_sec
     code: Optional[str] = None
     while time.time() < end:
         if logger:
             logger("等待验证码...")
-        if xpath:
-            try:
-                WebDriverWait(driver, 3).until(EC.presence_of_element_located((By.XPATH, xpath)))
-                code = extract_code_using_xpath(driver, xpath)
-                if code:
-                    if logger:
-                        logger(f"验证码通过XPath提取: {code}")
-                    return code
-            except Exception:
-                pass
-        code = extract_code_from_page_text(driver)
-        if code:
-            if logger:
-                logger(f"验证码通过文本提取: {code}")
-            return code
+            
+        # XinLan Mode Support
+        if extraction_mode == 'http' and extraction_url:
+            code = extract_code_from_url(extraction_url, logger)
+            if code:
+                if logger: logger(f"验证码通过HTTP提取: {code}")
+                return code
+            # If not found, fall through to sleep and retry
+        else:
+            # Original Logic
+            if xpath:
+                try:
+                    WebDriverWait(driver, 3).until(EC.presence_of_element_located((By.XPATH, xpath)))
+                    code = extract_code_using_xpath(driver, xpath)
+                    if code:
+                        if logger:
+                            logger(f"验证码通过XPath提取: {code}")
+                        return code
+                except Exception:
+                    pass
+            code = extract_code_from_page_text(driver)
+            if code:
+                if logger:
+                    logger(f"验证码通过文本提取: {code}")
+                return code
+                
         time.sleep(1)
     return None
 
@@ -1342,42 +1381,45 @@ def log_response_bodies(driver: webdriver.Remote, logger: Optional[Any], limit: 
         pass
 
 
-def extract_verification_code_unified(driver: webdriver.Remote, email_addr: str, password: str, resend_xpath: Optional[str], logger: Optional[Any], timeout: int = 400, proxy_config: Optional[Dict[str, Any]] = None, stop_event: Optional[threading.Event] = None) -> Optional[str]:
+def extract_verification_code_unified(driver: webdriver.Remote, email_addr: str, password: str, resend_xpath: Optional[str], logger: Optional[Any], timeout: int = 400, proxy_config: Optional[Dict[str, Any]] = None, stop_event: Optional[threading.Event] = None, extraction_mode: str = 'imap', extraction_url: str = None) -> Optional[str]:
     """
     Unified verification code extraction using src.captcha_receiver and UI interaction (Resend Code).
     Optimized to reuse IMAP connection.
+    Supports both IMAP and HTTP (XinLan) modes.
     """
     if logger:
-        logger(f"Unified Captcha: Start (Email: {email_addr})")
+        logger(f"Unified Captcha: Start (Email: {email_addr}) Mode: {extraction_mode}")
         if proxy_config:
             logger(f"Unified Captcha: Using Proxy {proxy_config.get('addr')}:{proxy_config.get('port')}")
 
     start_time = time.time()
-    max_retries = 4 # As per new requirement or consistent with previous
+    max_retries = 3 # As per new requirement (User requested max 3)
     
     # Ensure we are on the right window
     main_handle = driver.current_window_handle
 
-    # Initialize MailExtractor once
+    # Initialize MailExtractor once (Only for IMAP)
     extractor = None
+    imap_proxy = None
     
-    # NOTE: Updated to use proxy for IMAP by default to avoid blocking by email providers (e.g. 163.com)
-    # User Request: Use the same proxy as the browser window.
-    # We allow disabling it via env var "DISABLE_IMAP_PROXY" just in case.
-    use_imap_proxy = os.getenv("DISABLE_IMAP_PROXY", "false").lower() != "true"
-    imap_proxy = proxy_config if use_imap_proxy else None
-    
-    if logger and proxy_config:
-        if use_imap_proxy:
-             logger(f"Unified Captcha: IMAP Proxy ENABLED (Addr: {proxy_config.get('addr')})")
-        else:
-             logger("Unified Captcha: IMAP Proxy disabled via env var DISABLE_IMAP_PROXY")
+    if extraction_mode == 'imap':
+        # NOTE: Updated to use proxy for IMAP by default to avoid blocking by email providers (e.g. 163.com)
+        # User Request: Use the same proxy as the browser window.
+        # We allow disabling it via env var "DISABLE_IMAP_PROXY" just in case.
+        use_imap_proxy = os.getenv("DISABLE_IMAP_PROXY", "false").lower() != "true"
+        imap_proxy = proxy_config if use_imap_proxy else None
+        
+        if logger and proxy_config:
+            if use_imap_proxy:
+                 logger(f"Unified Captcha: IMAP Proxy ENABLED (Addr: {proxy_config.get('addr')})")
+            else:
+                 logger("Unified Captcha: IMAP Proxy disabled via env var DISABLE_IMAP_PROXY")
 
-    try:
-        extractor = MailExtractor(email_addr, password, proxy_config=imap_proxy, logger=logger)
-    except Exception as e:
-        if logger: logger(f"Unified Captcha: ❌ 初始化邮箱连接失败: {e}")
-        return None
+        try:
+            extractor = MailExtractor(email_addr, password, proxy_config=imap_proxy, logger=logger)
+        except Exception as e:
+            if logger: logger(f"Unified Captcha: ❌ 初始化邮箱连接失败: {e}")
+            return None
 
     try:
         for attempt in range(max_retries):
@@ -1390,45 +1432,161 @@ def extract_verification_code_unified(driver: webdriver.Remote, email_addr: str,
                 break
                 
             if logger: logger(f"=== 接码轮次 {attempt+1}/{max_retries} ===")
-            if logger: logger(f"步骤: 正在读取邮箱 {email_addr} 获取验证码...")
+            if logger: logger(f"步骤: 正在获取验证码 ({extraction_mode})...")
             
             # Call backend to get captcha
-            # Reuse the existing extractor instance
-            poll_timeout = 15 
+            poll_timeout = 25 # Increased for robustness
             t_poll_start = time.time()
             code = None
             
             # Inner poll loop
-            check_count = 0
-            while time.time() - t_poll_start < poll_timeout:
-                if stop_event and stop_event.is_set():
-                    return None
-                check_count += 1
+            if extraction_mode == 'http':
+                # XinLan HTTP Mode - Optimized
+                new_tab_handle = None
                 try:
-                    # Ensure extractor is alive
-                    if not extractor:
-                         if logger: logger("Unified Captcha: Re-initializing MailExtractor...")
-                         extractor = MailExtractor(email_addr, password, proxy_config=imap_proxy, logger=logger)
-
-                    if logger: logger(f"Unified Captcha: 第 {check_count} 次检查邮箱...")
-                    code = extractor.get_latest_verification_code()
-                    if code:
-                        break
-                except Exception as e:
-                    if logger: logger(f"Unified Captcha: ⚠️ 邮箱检查异常: {e}")
-                    # Try to reconnect if needed
-                    try:
-                        if extractor:
+                    if logger: logger(f"Unified Captcha: 开始HTTP获取流程 (Attempt {attempt+1})...")
+                    
+                    # 1. Open Tab (Once per attempt)
+                    driver.execute_script("window.open('');")
+                    new_tab_handle = driver.window_handles[-1]
+                    driver.switch_to.window(new_tab_handle)
+                    
+                    # 2. Navigate
+                    if logger: logger(f"Unified Captcha: 打开提取URL: {extraction_url}")
+                    driver.set_page_load_timeout(30)
+                    driver.get(extraction_url)
+                    
+                    # 3. Polling Loop
+                    check_count = 0
+                    last_refresh_time = time.time() # Track last refresh
+                    
+                    while time.time() - t_poll_start < poll_timeout:
+                        if stop_event and stop_event.is_set():
+                            break
+                        check_count += 1
+                        
+                        try:
+                            # NOTE: Do NOT refresh at start. Check content first!
+                            # Refresh only if necessary (long time no update).
+                            
+                            # Wait for body presence (fast check)
                             try:
-                                if hasattr(extractor, 'close'): extractor.close()
-                                elif hasattr(extractor, 'logout'): extractor.logout()
+                                WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
                             except:
-                                pass
-                        extractor = None # Force re-init next loop
-                    except:
-                        pass
-                    time.sleep(1)
-                time.sleep(3)
+                                if logger: logger("Unified Captcha: ⚠️ 页面加载超时或body未找到")
+                                driver.refresh()
+                                time.sleep(2)
+                                continue
+
+                            # Strategy 1: Specific Element (#msg2) - Primary
+                            try:
+                                msg2_element = WebDriverWait(driver, 1).until(EC.presence_of_element_located((By.ID, "msg2")))
+                                msg2_text = msg2_element.text.strip()
+                                
+                                # Log found content for debugging
+                                if msg2_text and logger: 
+                                    logger(f"Unified Captcha: 发现 #msg2 元素, 内容: '{msg2_text}'")
+                                
+                                # Verify if it looks like a code (6 digits)
+                                if re.match(r'^\d{6}$', msg2_text):
+                                    code = msg2_text
+                                    if logger: logger(f"Unified Captcha: ✅ 通过 #msg2 提取成功: {code}")
+                                    break
+                            except Exception:
+                                pass # Fallback to regex
+
+                            # Strategy 2: Body Regex - Fallback
+                            body_element = driver.find_element(By.TAG_NAME, 'body')
+                            body_text = body_element.text
+                            
+                            # Regex Logic (Enhanced)
+                            # 1. Strict isolated 6 digits
+                            matches = re.findall(r'\b\d{6}\b', body_text)
+                            temp_code = matches[0] if matches else None
+                            
+                            # 2. Loose 6 digits
+                            if not temp_code:
+                                matches = re.findall(r'\d{6}', body_text)
+                                temp_code = matches[0] if matches else None
+                            
+                            if temp_code:
+                                code = temp_code
+                                if logger: logger(f"Unified Captcha: HTTP提取成功 (Regex): {code}")
+                                break
+                            else:
+                                if logger: 
+                                    logger(f"Unified Captcha: 未找到验证码... (Retry in 2s)")
+                                    # Log HTML snippet for debugging as requested
+                                    try:
+                                        html_snippet = body_element.get_attribute('outerHTML')[:500]
+                                        # logger(f"Unified Captcha Debug HTML: {html_snippet}") # Optional: Uncomment if needed
+                                    except:
+                                        pass
+                                
+                                # Refresh Logic: Only refresh if it's been > 10s since last refresh/load
+                                # This allows JS to update the page without us wiping it out constantly
+                                if time.time() - last_refresh_time > 10:
+                                    if logger: logger("Unified Captcha: 页面无变化超过10秒，尝试刷新...")
+                                    driver.refresh()
+                                    last_refresh_time = time.time()
+                                    time.sleep(2) # Wait for reload
+                                
+                        except Exception as e:
+                            if logger: logger(f"Unified Captcha: ⚠️ 提取循环异常: {e}")
+                        
+                        time.sleep(2) # Short sleep to allow JS updates
+                        
+                except Exception as e:
+                    if logger: logger(f"Unified Captcha: ⚠️ HTTP模式致命错误: {e}")
+                finally:
+                    # Cleanup Tab
+                    try:
+                        if new_tab_handle:
+                            current_handles = driver.window_handles
+                            if new_tab_handle in current_handles:
+                                driver.switch_to.window(new_tab_handle)
+                                driver.close()
+                        driver.switch_to.window(main_handle)
+                    except Exception as close_err:
+                        if logger: logger(f"Unified Captcha: 标签页清理异常: {close_err}")
+                        try:
+                            driver.switch_to.window(main_handle)
+                        except:
+                            pass
+            
+            else:
+                # IMAP Mode
+                check_count = 0
+                while time.time() - t_poll_start < poll_timeout:
+                    if stop_event and stop_event.is_set():
+                        return None
+                    check_count += 1
+                    
+                    try:
+                        # Ensure extractor is alive
+                        if not extractor:
+                             if logger: logger("Unified Captcha: Re-initializing MailExtractor...")
+                             extractor = MailExtractor(email_addr, password, proxy_config=imap_proxy, logger=logger)
+
+                        if logger: logger(f"Unified Captcha: 第 {check_count} 次检查邮箱...")
+                        code = extractor.get_latest_verification_code()
+                        if code:
+                            break
+                    except Exception as e:
+                        if logger: logger(f"Unified Captcha: ⚠️ 邮箱检查异常: {e}")
+                        # Try to reconnect if needed
+                        try:
+                            if extractor:
+                                try:
+                                    if hasattr(extractor, 'close'): extractor.close()
+                                    elif hasattr(extractor, 'logout'): extractor.logout()
+                                except:
+                                    pass
+                            extractor = None # Force re-init next loop
+                        except:
+                            pass
+                        time.sleep(1)
+                    time.sleep(3)
 
             if code and code not in ["未匹配到验证码", "未找到邮件"] and not code.startswith("错误:"):
                 if logger: logger(f"Unified Captcha: ✅ 成功获取验证码: {code}")
@@ -1546,74 +1704,97 @@ def perform_registration(
                 'rdns': True
             }
         except Exception as e:
-            if logger: logger(f"代理配置解析失败: {e}")
+            if logger: logger(f"代理配置异常: {e}")
+
+    # Determine Extraction Mode based on auth_code/url format
+    # Standard: auth_code is password/code
+    # XinLan: auth_code starts with http
+    auth_code_or_url = str(row.get('auth_code') or row.get('授权码') or '').strip()
+    extraction_mode = 'imap'
+    extraction_url = None
+    
+    if auth_code_or_url.startswith('http'):
+        extraction_mode = 'http'
+        extraction_url = auth_code_or_url
+        if logger: logger(f"🔍 智能模式识别: 检测到接码链接，切换至 [心蓝/HTTP模式]")
+        if logger: logger(f"   接码URL: {extraction_url}")
+    else:
+        # Standard IMAP Mode
+        if logger: logger(f"🔍 智能模式识别: 未检测到接码链接，默认为 [IMAP模式]")
+        # Only initialize MailExtractor if NOT http mode
+        pass
             
-    # Resolve dynamic settings if they are callables
-    current_timeout = timeout_ms() if callable(timeout_ms) else timeout_ms
-    current_poll = poll_ms() if callable(poll_ms) else poll_ms
-    
-    if logger:
-        logger(f"当前任务参数: Timeout={current_timeout}ms, Poll={current_poll}ms")
+    # Pre-connection check REMOVED as per requirement
+    # We no longer check IMAP connectivity before starting browser.
+    # Failures will be handled during code extraction phase.
 
-    # Early target check
-    if target_check and target_check():
-        return False, 'target_reached'
+
+    try:
+        # Resolve dynamic settings if they are callables
+        current_timeout = timeout_ms() if callable(timeout_ms) else timeout_ms
+        current_poll = poll_ms() if callable(poll_ms) else poll_ms
         
-    if stop_event and stop_event.is_set():
-        return False, 'stopped'
-    if logger:
-        logger(f"create_profile {window_name}")
-    browser_id = None
-    driver = None
-    result_ok = False
-    
-    # Optimization: Disable QUIC to prevent UDP timeouts on proxies (common cause of page load hangs)
-    browser_cmd_args = ["--disable-quic"]
-    
-    try:
-        browser_id = client.update_browser(window_name, proxy_payload(host, port, proxy_username, proxy_password, protocol), enable_udp=udp_enabled, cmd_args=browser_cmd_args)
-    except Exception:
-        # 如果更新失败（如不存在），尝试创建
-        try:
-            browser_id = client.create_browser(window_name, proxy_payload(host, port, proxy_username, proxy_password, protocol), enable_udp=udp_enabled, cmd_args=browser_cmd_args)
-        except Exception as create_err:
-            if logger:
-                logger(f"创建窗口失败: {create_err}")
-            return False, f"create_browser failed: {create_err}"
-    if logger:
-        logger(f"profile_id {browser_id}")
-    open_data = client.open_browser(browser_id)
-    if logger:
-        logger(f"open_browser {browser_id} -> {open_data}")
-    if not (open_data.get('driver') and open_data.get('http')):
-        raise RuntimeError(f"open_browser 未返回 driver/http: {open_data}")
-    
-    # Wait for browser to fully start
-    time.sleep(5)
-    
-    try:
-        driver = open_attached_driver(open_data)
-    except Exception as attach_err:
         if logger:
-            logger(f"连接浏览器失败，尝试重试: {attach_err}")
-        time.sleep(3)
-        driver = open_attached_driver(open_data)
-    t_attached = time.time()
-    gate_state = 'attached'
-    debug_tab_opened = False
+            logger(f"当前任务参数: Timeout={current_timeout}ms, Poll={current_poll}ms")
     
-    # Headless Mode: Move window off-screen instead of minimize for stability
-    if headless_mode:
+        # Early target check
+        if target_check and target_check():
+            return False, 'target_reached'
+            
+        if stop_event and stop_event.is_set():
+            return False, 'stopped'
+        if logger:
+            logger(f"create_profile {window_name}")
+        browser_id = None
+        driver = None
+        result_ok = False
+        
+        # Optimization: Disable QUIC to prevent UDP timeouts on proxies (common cause of page load hangs)
+        browser_cmd_args = ["--disable-quic"]
+        
         try:
-            driver.set_window_position(-3000, 0)
+            browser_id = client.update_browser(window_name, proxy_payload(host, port, proxy_username, proxy_password, protocol), enable_udp=udp_enabled, cmd_args=browser_cmd_args)
         except Exception:
+            # 如果更新失败（如不存在），尝试创建
             try:
-                driver.minimize_window()
+                browser_id = client.create_browser(window_name, proxy_payload(host, port, proxy_username, proxy_password, protocol), enable_udp=udp_enabled, cmd_args=browser_cmd_args)
+            except Exception as create_err:
+                if logger:
+                    logger(f"创建窗口失败: {create_err}")
+                return False, f"create_browser failed: {create_err}"
+        if logger:
+            logger(f"profile_id {browser_id}")
+        open_data = client.open_browser(browser_id)
+        if logger:
+            logger(f"open_browser {browser_id} -> {open_data}")
+        if not (open_data.get('driver') and open_data.get('http')):
+            raise RuntimeError(f"open_browser 未返回 driver/http: {open_data}")
+        
+        # Wait for browser to fully start
+        time.sleep(5)
+        
+        try:
+            driver = open_attached_driver(open_data)
+        except Exception as attach_err:
+            if logger:
+                logger(f"连接浏览器失败，尝试重试: {attach_err}")
+            time.sleep(3)
+            driver = open_attached_driver(open_data)
+        t_attached = time.time()
+        gate_state = 'attached'
+        debug_tab_opened = False
+        
+        # Headless Mode: Move window off-screen instead of minimize for stability
+        if headless_mode:
+            try:
+                driver.set_window_position(-3000, 0)
             except Exception:
-                pass
+                try:
+                    driver.minimize_window()
+                except Exception:
+                    pass
 
-    result_ok = False
-    try:
+        result_ok = False
         if logger:
             logger("步骤: 打开平台网址")
         if not check_connectivity(driver, platform_url, logger, max_wait=45):
@@ -1642,6 +1823,7 @@ def perform_registration(
         except Exception:
             pass
         ready = False
+        
         for xp_key in ('language_menu', 'signin_btn', 'Creative Studio'):
             try:
                 xp_val = xpaths.get(xp_key)
@@ -1880,7 +2062,7 @@ def perform_registration(
         
         # 强制等待5秒，防止滑块刚过就去接码，导致接到旧验证码
         if logger: logger("步骤: 滑块通过，强制等待 5 秒...")
-        time.sleep(5)
+        time.sleep(1)
 
         # 优化: 滑块通过后，直接跳转接码页等待验证码
         if logger:
@@ -1931,7 +2113,18 @@ def perform_registration(
                         logger(f"⚠️ 风险提示: {domain} 邮箱的授权码与密码相同。请确认您使用的是IMAP专用授权码，而非网页登录密码。", level="warning")
         except Exception:
             pass
-        code = extract_verification_code_unified(driver, email, password_for_imap, resend_xp, logger, timeout=400, proxy_config=proxy_config, stop_event=stop_event)
+        code = extract_verification_code_unified(
+            driver, 
+            email, 
+            password_for_imap, 
+            resend_xp, 
+            logger, 
+            timeout=400, 
+            proxy_config=proxy_config, 
+            stop_event=stop_event,
+            extraction_mode=extraction_mode,
+            extraction_url=extraction_url
+        )
         
         if not code:
             if logger:

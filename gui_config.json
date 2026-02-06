@@ -12,5 +12,7 @@
   "ip_def_pass": "F4qDNjjBHg",
   "ip_def_protocol": "socks5",
   "ip_config_path": "config/ip_pool.json",
-  "udp_enabled": true
+  "udp_enabled": true,
+  "email_mode": "心蓝模式",
+  "target_reg_count": "1"
 }
