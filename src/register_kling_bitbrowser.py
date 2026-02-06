@@ -212,6 +212,62 @@ class RegistrationEvents:
     on_finish: Optional[Callable[[str, bool, str], None]] = None  # email, success, message
 
 
+# =============================================================================
+# PROCESS UTILITIES
+# =============================================================================
+
+def get_pid_by_port(port: int) -> Optional[int]:
+    """Find PID of the process listening on a specific TCP port."""
+    try:
+        # psutil.net_connections requires root/admin on some OS/versions for all PIDs
+        # But for user-owned processes it often works.
+        for conn in psutil.net_connections(kind='inet'):
+            if conn.laddr.port == port and conn.status == psutil.CONN_LISTEN:
+                return conn.pid
+    except (psutil.AccessDenied, psutil.NoSuchProcess):
+        pass
+    return None
+
+def kill_process_tree(pid: int, logger: Optional[Callable[[str], None]] = None) -> None:
+    """Kill a process and all its children forcibly."""
+    try:
+        if not psutil.pid_exists(pid):
+            return
+        parent = psutil.Process(pid)
+        children = parent.children(recursive=True)
+        for child in children:
+            try:
+                child.kill()
+            except psutil.NoSuchProcess:
+                pass
+        parent.kill()
+        try:
+            parent.wait(3)
+        except psutil.TimeoutExpired:
+            pass
+        if logger:
+            logger(f"已强制结束进程 PID={pid}")
+    except psutil.NoSuchProcess:
+        pass
+    except Exception as e:
+        if logger:
+            logger(f"结束进程 PID={pid} 失败: {e}")
+
+def kill_all_bitbrowsers(logger: Optional[Callable[[str], None]] = None) -> None:
+    """Force kill all BitBrowser processes."""
+    target_names = ['BitBrowser.exe', 'BitBrowser']
+    killed_count = 0
+    for proc in psutil.process_iter(['pid', 'name']):
+        try:
+            if proc.info['name'] in target_names:
+                kill_process_tree(proc.info['pid'], logger)
+                killed_count += 1
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    if logger and killed_count > 0:
+        logger(f"已清理 {killed_count} 个残留 BitBrowser 进程")
+
+
 class BitBrowserClient:
     """Client for interacting with BitBrowser API."""
     
@@ -2241,8 +2297,21 @@ def step_verify(
     
     open_data = client.open_browser(browser_id)
     ctx['open_data'] = open_data
+    
+    # Try to get PID for cleanup
+    browser_pid = open_data.get('pid')
+    if not browser_pid and open_data.get('http'):
+        try:
+            addr = open_data.get('http')
+            if ':' in addr:
+                port = int(addr.split(':')[-1])
+                browser_pid = get_pid_by_port(port)
+        except Exception:
+            pass
+    ctx['browser_pid'] = browser_pid
+    
     if logger:
-        logger(f"open_browser {browser_id} -> {open_data}")
+        logger(f"open_browser {browser_id} -> {open_data} (PID={browser_pid})")
     
     if not (open_data.get('driver') and open_data.get('http')):
         raise RuntimeError(f"open_browser 未返回 driver/http: {open_data}")
@@ -2945,6 +3014,16 @@ def perform_registration(
                         client.close_browser(browser_id)
                     except Exception:
                         pass
+                    
+                    # Force kill if PID known and process still exists
+                    pid = ctx.get('browser_pid')
+                    if pid:
+                        # Give it a moment to close gracefully
+                        time.sleep(1.0)
+                        if psutil.pid_exists(pid):
+                            if logger:
+                                logger(f"检测到浏览器进程 PID={pid} 仍存在，执行强制清理")
+                            kill_process_tree(pid, logger)
             except Exception:
                 pass
 
