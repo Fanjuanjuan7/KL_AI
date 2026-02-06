@@ -1,25 +1,108 @@
+"""
+邮箱池管理模块。
+
+该模块提供了邮箱池的管理功能，包括邮箱的加载、保存、导入、状态更新和统计等。
+支持多种邮箱格式（IMAP模式、心蓝模式）以及不同分隔符的数据解析。
+
+文件格式:
+    每行一个邮箱，格式为: email----password----auth_code----status
+    - email: 邮箱地址
+    - password: 邮箱密码
+    - auth_code: 授权码（IMAP模式）或URL（心蓝模式）
+    - status: 邮箱状态（new/success/registered/processing/failed/disabled等）
+"""
+
 import os
 import random
 import threading
 import shutil
 import tempfile
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Callable, Final
+
+
+# =============================================================================
+# 常量和配置
+# =============================================================================
+
+# 字段分隔符
+FIELD_SEPARATOR: Final[str] = "----"
+
+# 心蓝模式默认密码
+XINLAN_DEFAULT_PASSWORD: Final[str] = "Juan123123."
+
+# 邮箱状态定义
+class EmailStatus:
+    """邮箱状态常量定义。"""
+    NEW = "new"           # 新建/未使用
+    SUCCESS = "success"   # 成功
+    REGISTERED = "registered"  # 已注册
+    SUBMITTED = "submitted"    # 已提交
+    PROCESSING = "processing"  # 处理中
+    FAILED = "failed"     # 失败
+    STOPPED = "stopped"   # 已停止
+    DISABLED = "disabled" # 已禁用
+    INVALID = "invalid"   # 无效
+    BANNED = "banned"     # 已封禁
+    USED = "used"         # 已使用
+
+# 无效状态集合（邮箱不可用于注册）
+INVALID_STATUSES: Final[set] = {EmailStatus.DISABLED, EmailStatus.INVALID, EmailStatus.BANNED}
+
+# 已完成状态集合（邮箱已成功完成注册流程）
+COMPLETED_STATUSES: Final[set] = {EmailStatus.SUCCESS, EmailStatus.REGISTERED, EmailStatus.SUBMITTED}
+
+# 导入格式类型
+class ImportFormat:
+    """导入格式类型。"""
+    IMAP_3COL = "imap_3col"       # Email----Password----AuthCode
+    XINLAN_2COL = "xinlan_2col"   # Email----URL
+    XINLAN_3COL = "xinlan_3col"   # Email----Password----URL
+    LEGACY = "legacy"             # 空格/制表符分隔
+
 
 class EmailPool:
-    def __init__(self, pool_file: str):
-        self.pool_file = pool_file
+    """
+    邮箱池管理类。
+    
+    管理邮箱列表的加载、保存、状态更新和统计功能。
+    支持线程安全的并发访问，并提供变更通知机制。
+    
+    Attributes:
+        pool_file: 邮箱池文件路径
+        emails: 邮箱列表，每个邮箱是一个字典
+        _listeners: 状态变更监听器列表
+        _lock: 线程锁，用于并发控制
+    """
+
+    def __init__(self, pool_file: str) -> None:
+        """
+        初始化邮箱池。
+        
+        Args:
+            pool_file: 邮箱池文件的路径
+        """
+        self.pool_file: str = pool_file
         self.emails: List[Dict[str, str]] = []
-        self._listeners = []
-        self._lock = threading.RLock()
+        self._listeners: List[Callable[[], None]] = []
+        self._lock: threading.RLock = threading.RLock()
         self._load_pool()
 
-    def add_listener(self, callback):
-        """Register a callback for status changes."""
+    def add_listener(self, callback: Callable[[], None]) -> None:
+        """
+        注册状态变更回调函数。
+        
+        Args:
+            callback: 状态变更时调用的回调函数，无参数
+        """
         with self._lock:
             self._listeners.append(callback)
 
-    def _notify_listeners(self):
-        """Notify all listeners of a change."""
+    def _notify_listeners(self) -> None:
+        """
+        通知所有监听器状态已变更。
+        
+        在锁外调用回调函数，避免死锁。
+        """
         with self._lock:
             listeners = list(self._listeners)
         
@@ -29,15 +112,27 @@ class EmailPool:
             except Exception as e:
                 print(f"Error in listener callback: {e}")
 
-    def _load_pool(self):
+    def _load_pool(self) -> None:
+        """
+        从文件加载邮箱池。
+        
+        解析文件中的每行数据，提取邮箱、密码、授权码和状态。
+        支持以 # 开头的注释行和空行。
+        
+        状态规范化:
+            - 空状态或 'new' 统一为 'new'
+            - 其他状态转换为小写
+        """
         if not os.path.exists(self.pool_file):
             return
 
         with self._lock:
+            lines: List[str] = []
             try:
                 with open(self.pool_file, 'r', encoding='utf-8') as f:
                     lines = f.readlines()
-            except Exception:
+            except (IOError, OSError, UnicodeDecodeError) as e:
+                print(f"Error reading pool file: {e}")
                 lines = []
 
             for line in lines:
@@ -45,16 +140,14 @@ class EmailPool:
                 if not line or line.startswith('#'):
                     continue
                 
-                parts = line.split('----')
+                parts = line.split(FIELD_SEPARATOR)
                 email = parts[0].strip()
                 password = parts[1].strip() if len(parts) > 1 else ""
                 auth_code = parts[2].strip() if len(parts) > 2 else password
-                raw_status = parts[3].strip() if len(parts) > 3 else "new"
+                raw_status = parts[3].strip() if len(parts) > 3 else EmailStatus.NEW
 
-                # Normalize status
-                status = raw_status.lower()
-                if not status or status == 'new':
-                    status = 'new'
+                # 规范化状态
+                status = self._normalize_status(raw_status)
 
                 self.emails.append({
                     'email': email,
@@ -63,11 +156,32 @@ class EmailPool:
                     'status': status
                 })
 
-    def _save_pool(self):
+    def _normalize_status(self, status: str) -> str:
+        """
+        规范化邮箱状态。
+        
+        Args:
+            status: 原始状态字符串
+            
+        Returns:
+            规范化后的状态字符串
+        """
+        status = status.lower()
+        if not status or status == EmailStatus.NEW:
+            return EmailStatus.NEW
+        return status
+
+    def _save_pool(self) -> None:
+        """
+        保存邮箱池到文件。
+        
+        使用原子写入策略：先写入临时文件，再重命名为目标文件，
+        确保即使在写入过程中发生错误也不会损坏原文件。
+        """
+        temp_path: Optional[str] = None
         try:
-            # Atomic write: write to temp file then rename
             with self._lock:
-                # Create temp file in the same directory to ensure atomic rename works across filesystems
+                # 在同一目录创建临时文件，确保原子重命名跨文件系统工作
                 dir_name = os.path.dirname(self.pool_file) or '.'
                 with tempfile.NamedTemporaryFile('w', dir=dir_name, delete=False, encoding='utf-8') as tf:
                     temp_path = tf.name
@@ -75,35 +189,54 @@ class EmailPool:
                         email = item['email']
                         password = item['password']
                         auth_code = item['auth_code']
-                        status = item.get('status', 'new')
-                        tf.write(f"{email}----{password}----{auth_code}----{status}\n")
+                        status = item.get('status', EmailStatus.NEW)
+                        tf.write(f"{email}{FIELD_SEPARATOR}{password}{FIELD_SEPARATOR}{auth_code}{FIELD_SEPARATOR}{status}\n")
                 
-                # Rename temp to actual
+                # 重命名临时文件到实际文件
                 shutil.move(temp_path, self.pool_file)
 
-        except Exception as e:
+        except (IOError, OSError) as e:
             print(f"Failed to save pool: {e}")
-            if 'temp_path' in locals() and os.path.exists(temp_path):
+        finally:
+            # 清理临时文件
+            if temp_path and os.path.exists(temp_path):
                 try:
                     os.remove(temp_path)
-                except:
+                except (IOError, OSError):
                     pass
 
     def is_email_valid(self, email: str) -> bool:
-        """Check if an email is valid for registration."""
+        """
+        检查邮箱是否可用于注册。
+        
+        邮箱无效的情况包括：
+        - 邮箱不存在于池中
+        - 邮箱状态为 disabled/invalid/banned
+        
+        Args:
+            email: 要检查的邮箱地址
+            
+        Returns:
+            如果邮箱有效返回 True，否则返回 False
+        """
         with self._lock:
             for item in self.emails:
                 if item['email'] == email:
-                    status = item.get('status', 'new').lower()
-                    # User requested explicit rejection for "invalid" or "disabled" status
-                    # We treat 'disabled', 'invalid', 'banned' as invalid
-                    if status in ('disabled', 'invalid', 'banned'):
+                    status = item.get('status', EmailStatus.NEW).lower()
+                    # 禁用状态视为无效
+                    if status in INVALID_STATUSES:
                         return False
                     return True
-        return False # Email not found is also invalid for our pool
+        return False  # 邮箱不存在也视为无效
 
-    def update_email_status(self, email: str, status: str):
-        """Update status for an email and save."""
+    def update_email_status(self, email: str, status: str) -> None:
+        """
+        更新邮箱状态并保存。
+        
+        Args:
+            email: 要更新的邮箱地址
+            status: 新状态
+        """
         dirty = False
         with self._lock:
             for item in self.emails:
@@ -115,59 +248,98 @@ class EmailPool:
             if dirty:
                 self._save_pool()
         
-        # Notify outside lock
+        # 在锁外通知监听器
         if dirty:
             self._notify_listeners()
 
     def check_email_availability(self, email: str) -> tuple[bool, str]:
-        """Check if email is available for registration."""
+        """
+        检查邮箱是否可用于注册。
+        
+        可用性判断：
+        - success/registered/submitted: 已完成，不可用
+        - disabled/invalid/banned: 已禁用，不可用
+        - processing: 正在处理中，不可用
+        - new/failed/stopped: 可用
+        
+        Args:
+            email: 要检查的邮箱地址
+            
+        Returns:
+            (是否可用, 状态说明)
+        """
         with self._lock:
             for item in self.emails:
                 if item['email'] == email:
-                    status = item.get('status', 'new')
-                    # 'new', 'failed', 'stopped' are usually considered retryable or available depending on logic.
-                    # 'success', 'registered', 'submitted' are definitely done.
-                    # 'processing' means currently in use.
+                    status = item.get('status', EmailStatus.NEW)
                     
-                    if status in ('success', 'registered', 'submitted'):
+                    if status in COMPLETED_STATUSES:
                          return False, f"状态为 {status}"
-                    if status in ('disabled', 'invalid', 'banned'):
+                    if status in INVALID_STATUSES:
                          return False, "该邮箱已被禁用"
-                    if status == 'processing':
+                    if status == EmailStatus.PROCESSING:
                          return False, "正在处理中"
-                    # For 'failed' or 'stopped', we generally allow retry unless explicitly filtered elsewhere.
-                    # But if the user says "No available emails", it might be because everything is marked 'failed' or 'processing'.
-                    # We should be permissive here: as long as it's not success/registered/processing, it's available.
+                    # failed/stopped 状态允许重试
                     return True, "可用"
             return False, "未找到"
 
     def is_email_registered(self, email: str) -> bool:
-        """Legacy check."""
+        """
+        检查邮箱是否已注册（兼容旧版）。
+        
+        Args:
+            email: 要检查的邮箱地址
+            
+        Returns:
+            如果邮箱已注册返回 True
+        """
         avail, _ = self.check_email_availability(email)
         return not avail
 
-    def get_stats(self, mode_filter: str = None) -> Dict[str, int]:
+    def get_stats(self, mode_filter: Optional[str] = None) -> Dict[str, int]:
+        """
+        获取邮箱池统计信息。
+        
+        Args:
+            mode_filter: 模式过滤器
+                - "心蓝模式": 只统计 auth_code 以 http 开头的邮箱
+                - "IMAP模式": 只统计 auth_code 不以 http 开头的邮箱
+                - None: 统计所有邮箱
+                
+        Returns:
+            包含 total_emails 和 used_emails 的字典
+        """
         with self._lock:
-            # Filter emails based on mode if provided
+            # 根据模式过滤邮箱
             if mode_filter == "心蓝模式":
-                # XinLan: auth_code starts with http
+                # 心蓝模式: auth_code 以 http 开头
                 target_emails = [e for e in self.emails if e.get('auth_code', '').startswith('http')]
             elif mode_filter == "IMAP模式":
-                # IMAP: auth_code does NOT start with http
+                # IMAP模式: auth_code 不以 http 开头
                 target_emails = [e for e in self.emails if not e.get('auth_code', '').startswith('http')]
             else:
                 target_emails = self.emails
 
             total = len(target_emails)
-            # Used = success, registered, submitted, used.
-            used = sum(1 for e in target_emails if e.get('status', 'new') in ('success', 'registered', 'submitted', 'used'))
+            # 已使用 = success/registered/submitted/used
+            completed_statuses = COMPLETED_STATUSES | {EmailStatus.USED}
+            used = sum(1 for e in target_emails if e.get('status', EmailStatus.NEW) in completed_statuses)
+            
         return {
             'total_emails': total,
             'used_emails': used
         }
 
     def delete_email(self, email: str) -> bool:
-        """Delete an email from the pool."""
+        """
+        从池中删除邮箱。
+        
+        Args:
+            email: 要删除的邮箱地址
+            
+        Returns:
+            如果删除成功返回 True
+        """
         deleted = False
         with self._lock:
             initial_len = len(self.emails)
@@ -181,7 +353,16 @@ class EmailPool:
         return deleted
 
     def update_status(self, email: str, status: str) -> bool:
-        """Update status of an email."""
+        """
+        更新邮箱状态（update_email_status 的别名）。
+        
+        Args:
+            email: 要更新的邮箱地址
+            status: 新状态
+            
+        Returns:
+            如果状态发生变化返回 True
+        """
         updated = False
         with self._lock:
             for e in self.emails:
@@ -198,84 +379,127 @@ class EmailPool:
         return updated
 
     def get_email_config(self, email: str) -> Optional[Dict[str, str]]:
+        """
+        获取邮箱配置信息。
+        
+        Args:
+            email: 邮箱地址
+            
+        Returns:
+            邮箱配置字典，不存在则返回 None
+        """
         with self._lock:
             for item in self.emails:
                 if item['email'] == email:
                     return item
         return None
 
-    XINLAN_DEFAULT_PASSWORD = "Juan123123."
+    def _parse_email_line(self, line: str) -> Optional[Dict[str, str]]:
+        """
+        解析单行邮箱数据。
+        
+        支持的格式:
+        1. IMAP (3-col): Email----Password----AuthCode
+        2. XinLan (2-col): Email----URL (Password 默认为 XINLAN_DEFAULT_PASSWORD)
+        3. XinLan (3-col): Email----Password----URL
+        4. Legacy: Email Password AuthCode (空格/制表符分隔)
+        
+        Args:
+            line: 要解析的行数据
+            
+        Returns:
+            解析后的邮箱字典，解析失败返回 None
+        """
+        # 初始化默认值
+        email = ""
+        password = ""
+        auth_code = ""
+
+        # 优先尝试 ---- 分隔符
+        if FIELD_SEPARATOR in line:
+            parts = line.split(FIELD_SEPARATOR)
+            email = parts[0].strip()
+            
+            if len(parts) >= 2:
+                part2 = parts[1].strip()
+                # 判断是心蓝2列格式 (Email----URL) 还是标准格式
+                if part2.startswith('http'):
+                    # 心蓝2列格式
+                    password = XINLAN_DEFAULT_PASSWORD
+                    auth_code = part2
+                else:
+                    # 标准IMAP或心蓝3列格式
+                    password = part2
+                    if len(parts) >= 3:
+                        part3 = parts[2].strip()
+                        # part3 在心蓝模式是URL，在IMAP模式是授权码
+                        # 下游逻辑会根据是否以 http 开头判断模式
+                        auth_code = part3
+                    else:
+                        # IMAP 2列格式: auth_code 默认为 password
+                        auth_code = password
+        else:
+            # 尝试空格/制表符分隔（旧版格式）
+            parts = line.replace('\t', ' ').split()
+            if not parts:
+                return None
+            email = parts[0].strip()
+            password = parts[1].strip() if len(parts) > 1 else ""
+            auth_code = parts[2].strip() if len(parts) > 2 else password
+
+        if not email:
+            return None
+
+        return {
+            'email': email,
+            'password': password,
+            'auth_code': auth_code,
+            'status': EmailStatus.NEW
+        }
 
     def import_emails(self, content: str, overwrite: bool = True) -> int:
         """
-        Import emails from string content.
-        Supported Formats:
+        从字符串内容导入邮箱。
+        
+        支持的格式:
         1. IMAP (3-col): Email----Password----AuthCode
-        2. XinLan (2-col): Email----URL (Password defaults to 'Juan123123.')
+        2. XinLan (2-col): Email----URL (Password 默认为 'Juan123123.')
         3. XinLan (3-col): Email----Password----URL
-        4. Legacy: Email Password AuthCode (Space/Tab separated)
+        4. Legacy: Email Password AuthCode (空格/制表符分隔)
+        
+        Args:
+            content: 包含邮箱数据的字符串
+            overwrite: 如果为 True，更新现有邮箱时将重置状态为 new
+            
+        Returns:
+            成功导入的邮箱数量
         """
         count = 0
         lines = content.splitlines()
         
         with self._lock:
-            if overwrite:
-                pass
-
             for line in lines:
                 line = line.strip()
                 if not line or line.startswith('#'):
                     continue
                 
-                # Default values
-                email = ""
-                password = ""
-                auth_code = ""
-
-                # Try ---- split first
-                if '----' in line:
-                    parts = line.split('----')
-                    email = parts[0].strip()
-                    
-                    # Logic to distinguish modes based on content
-                    if len(parts) >= 2:
-                        part2 = parts[1].strip()
-                        # Case 1: XinLan 2-col (Email----URL)
-                        if part2.startswith('http'):
-                            password = self.XINLAN_DEFAULT_PASSWORD
-                            auth_code = part2
-                        else:
-                            # Standard/IMAP or XinLan 3-col
-                            password = part2
-                            if len(parts) >= 3:
-                                part3 = parts[2].strip()
-                                # Case 2: XinLan 3-col (Email----Password----URL)
-                                # Case 3: IMAP 3-col (Email----Password----AuthCode)
-                                # In both cases, part3 is stored as auth_code.
-                                # Downstream logic (in register_kling_bitbrowser.py) will check if it starts with 'http'
-                                auth_code = part3
-                            else:
-                                # Fallback: IMAP 2-col (Email----Password) -> AuthCode = Password
-                                auth_code = password
-                else:
-                    # Try space/tab split (Legacy)
-                    parts = line.replace('\t', ' ').split()
-                    if not parts: continue
-                    email = parts[0].strip()
-                    password = parts[1].strip() if len(parts) > 1 else ""
-                    auth_code = parts[2].strip() if len(parts) > 2 else password
-
-                if not email:
+                # 解析邮箱数据
+                parsed = self._parse_email_line(line)
+                if not parsed:
                     continue
 
-                # Upsert
+                email = parsed['email']
+                password = parsed['password']
+                auth_code = parsed['auth_code']
+
+                # 更新或插入
                 found = False
                 for item in self.emails:
                     if item['email'] == email:
                         item['password'] = password
                         item['auth_code'] = auth_code
                         if overwrite:
-                            item['status'] = 'new'
+                            item['status'] = EmailStatus.NEW
                         found = True
                         break
                 
@@ -284,25 +508,32 @@ class EmailPool:
                         'email': email,
                         'password': password,
                         'auth_code': auth_code,
-                        'status': 'new'
+                        'status': EmailStatus.NEW
                     })
                 count += 1
             
             if count > 0:
                 self._save_pool()
         
+        # 在锁外通知监听器
         if count > 0:
             self._notify_listeners()
             
         return count
 
-    def clear_emails(self):
-        """Clear all emails from the pool."""
+    def clear_emails(self) -> None:
+        """清空邮箱池中的所有邮箱。"""
         with self._lock:
             self.emails = []
             self._save_pool()
         self._notify_listeners()
 
     def get_all_rows(self) -> List[Dict[str, str]]:
+        """
+        获取所有邮箱数据。
+        
+        Returns:
+            邮箱字典列表的副本
+        """
         with self._lock:
             return list(self.emails)

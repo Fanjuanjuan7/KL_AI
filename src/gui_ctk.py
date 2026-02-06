@@ -1,28 +1,44 @@
-import os
-import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+"""
+KL-账号批量注册工具 - GUI 主模块
+
+基于 customtkinter 构建的图形用户界面，用于批量注册 KlingAI 账号。
+主要功能包括：
+- 注册任务管理：配置并执行批量注册任务
+- IP池管理：管理代理IP资源，支持导入/导出/状态监控
+- 邮箱池管理：管理邮箱账号，支持 IMAP 和 心蓝 两种模式
+
+作者: KL Team
+版本: 1.0.0
+"""
+
+# Standard library imports
+import csv
 import json
-import threading
+import os
+import platform
 import queue
-import tkinter
-from tkinter import filedialog, messagebox, ttk
-import customtkinter as ctk
 import subprocess
 import sys
-import csv
+import threading
 import time
-import psutil
 import traceback
-import platform
+from tkinter import filedialog, messagebox, ttk
+from typing import Dict
+
+# Third-party library imports
+import customtkinter as ctk
+import psutil
+import tkinter
+
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES
     HAS_DND = True
 except ImportError:
     HAS_DND = False
 
-from typing import Dict
+# Local module imports - Add parent directory to path for imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Imports assuming run from root via "python -m src.gui_ctk"
 try:
     from src.register_kling_bitbrowser import run_batch, read_rows
     from src.ip_manager import IPManager
@@ -35,17 +51,20 @@ except ImportError:
     from email_pool import EmailPool
     from health_server import start_health_server
 
+
 # Dynamic inheritance for DnD support
 BaseClasses = [ctk.CTk]
 if HAS_DND:
     BaseClasses.append(TkinterDnD.DnDWrapper)
 
+
 class App(*BaseClasses):
     def __init__(self):
         super().__init__()
-        # Start health server immediately
+        
+        # Start Health Server on port 9999
         try:
-            start_health_server()
+            start_health_server(9999)
         except Exception:
             pass
 
@@ -58,9 +77,6 @@ class App(*BaseClasses):
                 except Exception:
                     pass
         
-        # Start Health Server
-        start_health_server(9999)
-        
         self._main_thread_id = threading.get_ident()
         self._ui_queue: "queue.Queue[callable]" = queue.Queue()
         self._log_lock = threading.Lock()
@@ -69,11 +85,11 @@ class App(*BaseClasses):
         if getattr(sys, 'frozen', False):
             self.base_dir = os.path.dirname(__file__)
             self.exe_dir = os.path.dirname(sys.executable)
-            self.project_root = self.exe_dir # In frozen app, root is exe dir
+            self.project_root = self.exe_dir  # In frozen app, root is exe dir
         else:
-            self.base_dir = os.path.dirname(os.path.abspath(__file__)) # src/
-            self.project_root = os.path.dirname(self.base_dir) # root/
-            self.exe_dir = self.project_root # For compatibility
+            self.base_dir = os.path.dirname(os.path.abspath(__file__))  # src/
+            self.project_root = os.path.dirname(self.base_dir)  # root/
+            self.exe_dir = self.project_root  # For compatibility
             
         self._log_file_path = os.path.join(self.project_root, 'logs', 'app.log')
         self._perf_file_path = os.path.join(self.project_root, 'logs', 'perf.log')
@@ -93,7 +109,7 @@ class App(*BaseClasses):
 
         # Initialize Managers
         # State files in logs/ or config/? EmailManager uses it as status DB.
-        self.ip_manager = IPManager(os.path.join(self.project_root, 'config', 'ip_pool.json')) # Input pool
+        self.ip_manager = IPManager(os.path.join(self.project_root, 'config', 'ip_pool.json'))  # Input pool
         self.ip_manager.set_logger(self.append_log)
         
         # EmailPool stores config in config/email_pool.csv
@@ -117,9 +133,9 @@ class App(*BaseClasses):
         self.debounce_timer = None
         self._save_cfg_timer = None
         self.manual_refresh_mode = False
-        self.resource_check_interval = 5000 # Check resources every 5s
-        self.auto_refresh_interval = 30000 # Default 30s light poll
-        self.refresh_stats_perf = [] # Store last 10 refresh durations
+        self.resource_check_interval = 5000  # Check resources every 5s
+        self.auto_refresh_interval = 30000  # Default 30s light poll
+        self.refresh_stats_perf = []  # Store last 10 refresh durations
 
         # Use exe_dir for config/user files, base_dir for bundled resources
         # Default input CSV in config/email_pool.csv
@@ -243,13 +259,13 @@ class App(*BaseClasses):
                         foreground=fg_color,
                         fieldbackground=field_bg,
                         borderwidth=0,
-                        font=("Arial", 11)) # Reduced from 12
+                        font=("Arial", 11))  # Reduced from 12
         
         style.configure("Treeview.Heading",
                         background=header_bg,
                         foreground=fg_color,
                         relief="flat",
-                        font=("Arial", 12, "bold")) # Reduced from 13
+                        font=("Arial", 12, "bold"))  # Reduced from 13
                         
         style.map("Treeview",
                   background=[('selected', select_bg)])
@@ -310,7 +326,7 @@ class App(*BaseClasses):
                                                 command=lambda: self.trigger_refresh(force=True))
         # Place it relative to res_frame
         self.btn_manual_refresh.place(relx=0.95, rely=0.05, anchor='ne')
-        self.btn_manual_refresh.pack_forget() # Hide initially
+        self.btn_manual_refresh.pack_forget()  # Hide initially
         
         # Loading Indicator
         self.loading_label = ctk.CTkLabel(res_frame, text="⟳", font=("Arial", 20), text_color="gray")
@@ -324,7 +340,7 @@ class App(*BaseClasses):
         self.lbl_resources = ctk.CTkLabel(res_frame, text="CPU: 0%  RAM: 0%", font=("Arial", 12), text_color="gray")
         self.lbl_resources.pack(anchor='e', padx=10, pady=(0, 5))
 
-        ctk.CTkFrame(stats_panel, height=2, fg_color="gray").pack(fill='x', padx=10, pady=5) # Separator
+        ctk.CTkFrame(stats_panel, height=2, fg_color="gray").pack(fill='x', padx=10, pady=5)  # Separator
 
         # Task Status Section
         task_frame = ctk.CTkFrame(stats_panel, fg_color="transparent")
@@ -419,7 +435,7 @@ class App(*BaseClasses):
         def create_concurrent(p):
             f = ctk.CTkFrame(p, fg_color="transparent")
             self.concurrent_sel_var = tkinter.StringVar(value=str(self.concurrent_var.get()))
-            cb = ctk.CTkComboBox(f, values=[str(i) for i in range(1,21)], variable=self.concurrent_sel_var, 
+            cb = ctk.CTkComboBox(f, values=[str(i) for i in range(1, 21)], variable=self.concurrent_sel_var, 
                                command=lambda v: self.concurrent_var.set(int(v)), width=100)
             cb.pack(side='left')
             return f
@@ -442,7 +458,7 @@ class App(*BaseClasses):
             ctk.CTkLabel(f, text="ms (轮询").pack(side='left', padx=2)
             
             self.poll_sel_var = tkinter.StringVar(value=str(self.poll_ms_var.get()))
-            ctk.CTkComboBox(f, values=['300','500','700'], variable=self.poll_sel_var, 
+            ctk.CTkComboBox(f, values=['300', '500', '700'], variable=self.poll_sel_var, 
                           command=lambda v: self.poll_ms_var.set(int(v)), width=70).pack(side='left', padx=2)
             ctk.CTkLabel(f, text="ms)").pack(side='left')
             return f
@@ -451,7 +467,7 @@ class App(*BaseClasses):
         # 2. Build Output
         def create_build(p):
             f = ctk.CTkFrame(p, fg_color="transparent")
-            ctk.CTkEntry(f, textvariable=self.build_output_var).pack(side='left', fill='x', expand=True, padx=(0,5))
+            ctk.CTkEntry(f, textvariable=self.build_output_var).pack(side='left', fill='x', expand=True, padx=(0, 5))
             ctk.CTkButton(f, text="...", width=30, command=self.choose_build_output).pack(side='left')
             return f
         add_config_row(grid_frame, 1, 1, "输出目录:", create_build)
@@ -459,7 +475,7 @@ class App(*BaseClasses):
         # 3. Config Path
         def create_conf(p):
             f = ctk.CTkFrame(p, fg_color="transparent")
-            ctk.CTkEntry(f, textvariable=self.config_path_var).pack(side='left', fill='x', expand=True, padx=(0,5))
+            ctk.CTkEntry(f, textvariable=self.config_path_var).pack(side='left', fill='x', expand=True, padx=(0, 5))
             # Import/Export buttons
             ctk.CTkButton(f, text="导入", width=40, command=self.import_config).pack(side='left', padx=2)
             ctk.CTkButton(f, text="导出", width=40, command=self.export_config).pack(side='left', padx=2)
@@ -540,7 +556,6 @@ class App(*BaseClasses):
         list_frame = ctk.CTkFrame(parent)
         list_frame.pack(fill='both', expand=True, padx=12, pady=8)
         
-        from tkinter import ttk
         columns = ("host", "port", "user", "pass", "protocol", "status", "updated")
         self.ip_tree = ttk.Treeview(list_frame, columns=columns, show="headings", selectmode="extended")
         self.ip_tree.heading("host", text="Host/IP")
@@ -571,7 +586,7 @@ class App(*BaseClasses):
         list_frame.grid_columnconfigure(0, weight=1)
 
     def choose_ip_config_path(self):
-        p = filedialog.askopenfilename(filetypes=[('JSON','*.json'), ('All','*')])
+        p = filedialog.askopenfilename(filetypes=[('JSON', '*.json'), ('All', '*')])
         if p:
             self.ip_config_path_var.set(p)
             self.ip_manager = IPManager(p)
@@ -590,8 +605,10 @@ class App(*BaseClasses):
     def apply_ip_settings(self):
         try:
             val = self.ip_max_usage_var.get()
-            if val < 1: val = 1
-            if val > 999: val = 999
+            if val < 1:
+                val = 1
+            if val > 999:
+                val = 999
             self.ip_manager.set_max_usage(val)
             self.refresh_ip_stats()
             self.append_log(f"已更新最大使用次数为: {val}")
@@ -633,8 +650,8 @@ class App(*BaseClasses):
             self.ip_tree.insert("", "end", values=(
                 ip['host'], 
                 ip['port'], 
-                ip.get('proxyUserName',''), 
-                ip.get('proxyPassword',''),
+                ip.get('proxyUserName', ''), 
+                ip.get('proxyPassword', ''),
                 ip.get('protocol', 'socks5'),
                 status_text,
                 updated_str
@@ -642,7 +659,7 @@ class App(*BaseClasses):
 
     def import_ips_dialog(self):
         # Simple dialog to paste or load file
-        p = filedialog.askopenfilename(filetypes=[('Text/CSV','*.txt *.csv'), ('All','*')])
+        p = filedialog.askopenfilename(filetypes=[('Text/CSV', '*.txt *.csv'), ('All', '*')])
         if p:
             try:
                 with open(p, 'r', encoding='utf-8') as f:
@@ -655,7 +672,7 @@ class App(*BaseClasses):
                     default_pass=self.ip_def_pass_var.get().strip(),
                     default_protocol=self.ip_def_protocol_var.get().strip()
                 )
-                self.reload_ip_config() # This refreshes stats and list
+                self.reload_ip_config()  # This refreshes stats and list
                 messagebox.showinfo("导入成功", f"成功导入 {count} 个新IP")
                 self.append_log(f"导入 {count} 个IP来自 {p}")
             except Exception as e:
@@ -666,7 +683,7 @@ class App(*BaseClasses):
         top = ctk.CTkToplevel(self)
         top.title("粘贴导入IP")
         top.geometry("650x500")
-        top.attributes('-topmost', True) # Keep on top for focus
+        top.attributes('-topmost', True)  # Keep on top for focus
         
         # Main container with consistent padding and rounded corners
         main_frame = ctk.CTkFrame(top, corner_radius=10)
@@ -736,7 +753,7 @@ class App(*BaseClasses):
             new_count = int(val)
             if new_count < 0:
                 raise ValueError
-        except:
+        except Exception:
             messagebox.showerror("错误", "请输入有效的非负整数")
             return
             
@@ -775,18 +792,18 @@ class App(*BaseClasses):
                 with open(p, 'w', encoding='utf-8') as f:
                     f.write("host,port,user,pass,usage\n")
                     for ip in ips:
-                        f.write(f"{ip['host']},{ip['port']},{ip.get('proxyUserName','')},{ip.get('proxyPassword','')},{ip.get('usage_count',0)}\n")
+                        f.write(f"{ip['host']},{ip['port']},{ip.get('proxyUserName', '')},{ip.get('proxyPassword', '')},{ip.get('usage_count', 0)}\n")
                 messagebox.showinfo("导出成功", f"已导出 {len(ips)} 个IP")
             except Exception as e:
                 messagebox.showerror("导出失败", str(e))
 
     def choose_csv(self):
-        p = filedialog.askopenfilename(filetypes=[('CSV','*.csv'), ('All','*')])
+        p = filedialog.askopenfilename(filetypes=[('CSV', '*.csv'), ('All', '*')])
         if p:
             self.csv_var.set(p)
 
     def choose_xpath(self):
-        p = filedialog.askopenfilename(filetypes=[('JSON','*.json'), ('All','*')])
+        p = filedialog.askopenfilename(filetypes=[('JSON', '*.json'), ('All', '*')])
         if p:
             self.xpath_var.set(p)
 
@@ -796,7 +813,7 @@ class App(*BaseClasses):
             self.build_output_var.set(p)
 
     def choose_config_path(self):
-        p = filedialog.askopenfilename(filetypes=[('JSON','*.json'), ('All','*')])
+        p = filedialog.askopenfilename(filetypes=[('JSON', '*.json'), ('All', '*')])
         if p:
             self.config_path_var.set(p)
 
@@ -818,8 +835,8 @@ class App(*BaseClasses):
         self.preview.insert('end', txt)
         rows = read_rows(self.csv_var.get())
         total = len(rows)
-        succ = sum(1 for r in rows if str(r.get('status','')).strip() == 'good')
-        fail = sum(1 for r in rows if str(r.get('status','')).strip() == 'fail')
+        succ = sum(1 for r in rows if str(r.get('status', '')).strip() == 'good')
+        fail = sum(1 for r in rows if str(r.get('status', '')).strip() == 'fail')
         self.cnt_total_var.set(str(total))
         self.cnt_success_var.set(str(succ))
         self.cnt_fail_var.set(str(fail))
@@ -876,9 +893,9 @@ class App(*BaseClasses):
             pass
 
     def progress_cb(self, data):
-        self.cnt_total_var.set(str(data.get('total',0)))
-        self.cnt_success_var.set(str(data.get('success',0)))
-        self.cnt_fail_var.set(str(data.get('fail',0)))
+        self.cnt_total_var.set(str(data.get('total', 0)))
+        self.cnt_success_var.set(str(data.get('success', 0)))
+        self.cnt_fail_var.set(str(data.get('fail', 0)))
 
     def _build_email_pool_tab(self):
         parent = self.tab_email
@@ -950,8 +967,6 @@ class App(*BaseClasses):
         list_frame.pack(fill='both', expand=True, padx=12, pady=8)
         
         # Treeview for Emails
-        from tkinter import ttk
-        
         columns = ("email", "password", "auth_code", "status")
         self.email_tree = ttk.Treeview(list_frame, columns=columns, show="headings", selectmode="extended")
         self.email_tree.heading("email", text="邮箱账号")
@@ -967,8 +982,8 @@ class App(*BaseClasses):
         # Configure tags for colors
         self.email_tree.tag_configure('unused', foreground='#00AA00')  # Green (Available)
         self.email_tree.tag_configure('used', foreground='#808080')    # Grey (Registered/Used)
-        self.email_tree.tag_configure('invalid', foreground='#FF0000') # Red (Invalid/Banned)
-        self.email_tree.tag_configure('processing', foreground='#0000FF') # Blue (Processing)
+        self.email_tree.tag_configure('invalid', foreground='#FF0000')  # Red (Invalid/Banned)
+        self.email_tree.tag_configure('processing', foreground='#0000FF')  # Blue (Processing)
         self.email_tree.tag_configure('failed', foreground='#FFA500')  # Orange (Failed)
         
         # Bind double click for links
@@ -1102,12 +1117,12 @@ class App(*BaseClasses):
                 # Monitor & Alarm (Red if < 10% capacity)
                 total_possible = ip_stats.get('total_ips', 0) * ip_stats.get('max_usage', 5)
                 if total_possible > 0 and remaining_usage < (total_possible * 0.1):
-                     self.home_ip_stat_label.configure(text_color="#FF0000") # Alert Red
+                     self.home_ip_stat_label.configure(text_color="#FF0000")  # Alert Red
                      if not getattr(self, '_ip_low_warned', False):
                          self.append_log(f"警告: IP资源即将耗尽 (剩余可用次数: {remaining_usage})")
                          self._ip_low_warned = True
                 else:
-                     self.home_ip_stat_label.configure(text_color="#ff4d4d") # Default Red-ish
+                     self.home_ip_stat_label.configure(text_color="#ff4d4d")  # Default Red-ish
                      self._ip_low_warned = False
             
             # Email Stats
@@ -1165,7 +1180,7 @@ class App(*BaseClasses):
                  self.loading_label.place_forget()
 
     def import_emails_dialog(self):
-        p = filedialog.askopenfilename(filetypes=[('Text/CSV','*.txt *.csv'), ('All','*')])
+        p = filedialog.askopenfilename(filetypes=[('Text/CSV', '*.txt *.csv'), ('All', '*')])
         if p:
             try:
                 with open(p, 'r', encoding='utf-8') as f:
@@ -1222,7 +1237,7 @@ class App(*BaseClasses):
             try:
                 count = self.email_pool.import_emails(content, overwrite=overwrite_var.get())
                 self._update_email_list_ui()
-                self.trigger_refresh() # Update stats
+                self.trigger_refresh()  # Update stats
                 messagebox.showinfo("导入成功", f"成功导入/更新 {count} 个邮箱")
                 self.append_log(f"粘贴导入 {count} 个邮箱")
                 top.destroy()
@@ -1244,10 +1259,9 @@ class App(*BaseClasses):
         # Exports to the main registration task CSV format
         # Format required by register_kling_bitbrowser: email, (password?), ...
         # Actually register script reads keys: 'email', '账号', etc.
-        p = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[('CSV','*.csv')])
+        p = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[('CSV', '*.csv')])
         if p:
             try:
-                import csv
                 emails = self.email_pool.get_all_rows()
                 with open(p, 'w', newline='', encoding='utf-8') as f:
                     writer = csv.writer(f)
@@ -1292,7 +1306,7 @@ class App(*BaseClasses):
         # Filter if search
         query = self.email_search_var.get().strip().lower()
         
-        limit = 500 # Virtual scrolling limit
+        limit = 500  # Virtual scrolling limit
         count = 0
         
         for e in emails:
@@ -1334,7 +1348,7 @@ class App(*BaseClasses):
             else:
                 # Fallback for unknown statuses
                 status = f"❓ {status_val}"
-                tags = ('used',) # Default to 'used' look for unknowns
+                tags = ('used',)  # Default to 'used' look for unknowns
             
             # Mask auth code if encrypted
             auth = e.get('auth_code', '')
@@ -1358,10 +1372,14 @@ class App(*BaseClasses):
             return
 
         val = ""
-        if column == '#1': val = vals[0]
-        elif column == '#2': val = vals[1]
-        elif column == '#3': val = vals[2]
-        elif column == '#4': val = vals[3]
+        if column == '#1':
+            val = vals[0]
+        elif column == '#2':
+            val = vals[1]
+        elif column == '#3':
+            val = vals[2]
+        elif column == '#4':
+            val = vals[3]
         
         if val:
             self.clipboard_clear()
@@ -1436,7 +1454,7 @@ class App(*BaseClasses):
         if messagebox.askyesno("确认清空", "确定要清空所有邮箱数据吗？此操作不可撤销！"):
             self.email_pool.clear_emails()
             self._update_email_list_ui()
-            self.trigger_refresh() # Update stats
+            self.trigger_refresh()  # Update stats
             self.append_log("已清空所有邮箱数据")
 
 
@@ -1450,7 +1468,7 @@ class App(*BaseClasses):
         if cfg:
             auth = cfg.get('auth_code', '')
             # Show in dialog
-            self._update_email_list_ui() # Filter view
+            self._update_email_list_ui()  # Filter view
             
             # Also show popup
             top = ctk.CTkToplevel(self)
@@ -1485,7 +1503,7 @@ class App(*BaseClasses):
         for item in selected:
             vals = self.email_tree.item(item)['values']
             if vals:
-                email = vals[0] # email is first column
+                email = vals[0]  # email is first column
                 self.email_pool.delete_email(email)
                 count += 1
         
@@ -1513,7 +1531,7 @@ class App(*BaseClasses):
             
         try:
             max_reg = int(self.max_reg_count_var.get())
-        except:
+        except Exception:
             max_reg = 0
             
         if target_count > max_reg:
@@ -1551,7 +1569,7 @@ class App(*BaseClasses):
             if current_mode == "IMAP模式" and is_xinlan:
                 continue
 
-            valid_rows.append([e['email'], e.get('password',''), e.get('auth_code','')])
+            valid_rows.append([e['email'], e.get('password', ''), e.get('auth_code', '')])
             
         if not valid_rows:
             messagebox.showwarning("提示", "没有可用的邮箱账号 (所有账号均已使用)")
@@ -1640,9 +1658,9 @@ class App(*BaseClasses):
                     ip_manager=self.ip_manager,
                     exhaustion_cb=exhaustion,
                     target_success_count=target_count,
-                            email_pool=self.email_pool,
-                            headless_mode=self.headless_mode_var.get(),
-                            udp_enabled=self.udp_var.get()
+                    email_pool=self.email_pool,
+                    headless_mode=self.headless_mode_var.get(),
+                    udp_enabled=self.udp_var.get()
                 )
                 self.append_log("任务结束")
             except Exception as e:
@@ -1674,7 +1692,7 @@ class App(*BaseClasses):
                 try:
                     if os.path.exists(temp_csv):
                         os.remove(temp_csv)
-                except:
+                except Exception:
                     pass
 
         self.worker = threading.Thread(target=run, daemon=True)
@@ -1690,27 +1708,27 @@ class App(*BaseClasses):
             self.append_log("正在停止任务...")
 
     def import_config(self):
-        p = filedialog.askopenfilename(filetypes=[('JSON','*.json')])
+        p = filedialog.askopenfilename(filetypes=[('JSON', '*.json')])
         if p:
             self.config_path_var.set(p)
             self._load_config()
             self.append_log(f"已导入配置: {p}")
 
     def export_config(self):
-        p = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[('JSON','*.json')])
+        p = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[('JSON', '*.json')])
         if p:
             # Save current to p
             old_path = self.config_path_var.get()
             self.config_path_var.set(p)
             self.save_config()
-            self.config_path_var.set(old_path) # Restore? Or keep new? 
+            self.config_path_var.set(old_path)  # Restore? Or keep new? 
             # User likely wants to export a copy, but maybe switch to it?
             # Usually export means save copy. Switch means "Save As". 
             # I'll just save a copy and keep using current config path.
             self.append_log(f"已导出配置到: {p}")
 
     def choose_config_path(self):
-        p = filedialog.askopenfilename(filetypes=[('JSON','*.json')])
+        p = filedialog.askopenfilename(filetypes=[('JSON', '*.json')])
         if p:
             self.config_path_var.set(p)
             self._load_config()
@@ -1893,7 +1911,7 @@ class App(*BaseClasses):
         def _do_quit():
             try:
                 self.append_log("程序正在退出...")
-                self.save_config() # Ensure config is saved before exit
+                self.save_config()  # Ensure config is saved before exit
                 self.stop_registration()
                 self.quit()
                 self.destroy()
@@ -1964,14 +1982,13 @@ class App(*BaseClasses):
                             f.write(line)
             except Exception:
                 pass
-        except:
+        except Exception:
             pass
         self.after(self.resource_check_interval, self.update_resource_stats)
 
 
 def handle_exception(exc_type, exc_value, exc_traceback):
     """Global exception handler to log uncaught exceptions"""
-    import traceback
     import logging
     
     # Log the exception
@@ -1986,11 +2003,12 @@ def handle_exception(exc_type, exc_value, exc_traceback):
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         with open(log_path, 'a', encoding='utf-8') as f:
             f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Uncaught exception:\n{error_msg}\n")
-    except:
+    except Exception:
         pass
     
     # Call the default handler
     sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
 
 if __name__ == '__main__':
     # Set up global exception handler
@@ -2001,14 +2019,13 @@ if __name__ == '__main__':
         exe_dir = os.path.dirname(os.path.abspath(__file__))
         base_dir = os.path.dirname(exe_dir)
         os.makedirs(os.path.join(base_dir, 'logs'), exist_ok=True)
-    except:
+    except Exception:
         pass
     
     try:
         app = App()
         app.mainloop()
     except Exception as e:
-        import traceback
         import logging
         error_msg = f"Fatal error in main loop: {e}\n{traceback.format_exc()}"
         logging.error(error_msg)
@@ -2021,14 +2038,14 @@ if __name__ == '__main__':
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
             with open(log_path, 'a', encoding='utf-8') as f:
                 f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {error_msg}\n")
-        except:
+        except Exception:
             pass
         
         # Show error to user
         try:
             import tkinter.messagebox as messagebox
             messagebox.showerror("程序错误", f"程序发生严重错误:\n{e}\n\n请查看 logs/crash.log 了解详情。")
-        except:
+        except Exception:
             print(error_msg)
         
         raise
