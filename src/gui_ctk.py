@@ -28,6 +28,8 @@ from typing import Dict
 # Third-party library imports
 import customtkinter as ctk
 import psutil
+import re
+import ipaddress
 import tkinter
 
 try:
@@ -40,13 +42,13 @@ except ImportError:
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
-    from src.register_kling_bitbrowser import run_batch, read_rows
+    from src.register_kling_bitbrowser import run_batch, read_rows, RegistrationEvents
     from src.ip_manager import IPManager
     from src.email_pool import EmailPool
     from src.health_server import start_health_server
 except ImportError:
     # Fallback for direct execution (not recommended but handled)
-    from register_kling_bitbrowser import run_batch, read_rows
+    from register_kling_bitbrowser import run_batch, read_rows, RegistrationEvents
     from ip_manager import IPManager
     from email_pool import EmailPool
     from health_server import start_health_server
@@ -234,13 +236,46 @@ class App(*BaseClasses):
         try:
             if self.worker and self.worker.is_alive():
                 since = time.time() - float(self._last_worker_heartbeat or 0.0)
-                if since > 60:
+                if since > 180:
                     if hasattr(self, 'lbl_task_status'):
                         self.lbl_task_status.configure(text="状态：可能卡住（心跳超时）")
                     self.append_log(f"警告: 工作线程心跳超时 {int(since)}s，可能出现阻塞")
+                    
+                    # 超过300秒自动尝试强制终止
+                    if since > 300 and not getattr(self, '_force_terminate_attempted', False):
+                        self._force_terminate_attempted = True
+                        self.append_log("⚠️ 心跳超时超过300秒，尝试自动强制终止...")
+                        self._force_terminate_worker()
+                        # 3秒后检查是否成功
+                        self.after(3000, self._check_force_terminate_result)
         except Exception:
             pass
         self.after(2000, self._check_heartbeats)
+    
+    def _check_force_terminate_result(self):
+        """检查强制终止是否成功。"""
+        if self.worker and self.worker.is_alive():
+            self.append_log("❌ 自动强制终止失败，请手动点击'停止任务'或重启程序")
+            # User requested to suppress this dialog
+            # messagebox.showwarning(
+            #     "任务卡死", 
+            #     "检测到工作线程长时间阻塞且自动终止失败。\n"
+            #     "建议重启程序。\n\n"
+            #     "可能原因：\n"
+            #     "1. 网络连接超时\n"
+            #     "2. 浏览器驱动无响应\n"
+            #     "3. 系统资源不足"
+            # )
+        else:
+            self.append_log("✅ 工作线程已终止")
+            self.btn_start.configure(state="normal")
+            if hasattr(self, 'lbl_task_status'):
+                self.lbl_task_status.configure(text="状态：已终止")
+            self._force_terminate_attempted = False
+        
+    def _reset_force_terminate_flag(self):
+        """重置强制终止标志（在启动新任务时调用）。"""
+        self._force_terminate_attempted = False
 
     def _build_ui(self):
         # Configure Treeview Style for Dark Mode
@@ -548,35 +583,58 @@ class App(*BaseClasses):
         ctk.CTkButton(batch_frame, text="导入IP (TXT/CSV)", command=self.import_ips_dialog).pack(side='left', padx=6)
         ctk.CTkButton(batch_frame, text="粘贴导入IP", command=self.paste_import_ips_dialog).pack(side='left', padx=6)
         ctk.CTkButton(batch_frame, text="修改使用次数", command=self.modify_ip_usage_dialog).pack(side='left', padx=6)
-        ctk.CTkButton(batch_frame, text="删除IP (正则)", command=self.delete_ips_dialog).pack(side='left', padx=6)
+        ctk.CTkButton(batch_frame, text="删除选中IP", command=self.delete_selected_ips, fg_color="red", hover_color="#d63030").pack(side='left', padx=6)
         ctk.CTkButton(batch_frame, text="清空所有IP", command=self.clear_ips, fg_color="red").pack(side='left', padx=6)
         ctk.CTkButton(batch_frame, text="导出当前IP池", command=self.export_ips).pack(side='left', padx=6)
+
+        # Selection Frame
+        select_frame = ctk.CTkFrame(parent)
+        select_frame.pack(fill='x', padx=12, pady=(0, 8))
+        ctk.CTkButton(select_frame, text="全选", command=self.select_all_ips, width=80).pack(side='left', padx=6)
+        ctk.CTkButton(select_frame, text="取消全选", command=self.deselect_all_ips, width=80).pack(side='left', padx=6)
+        ctk.CTkButton(select_frame, text="反选", command=self.invert_ip_selection, width=80).pack(side='left', padx=6)
+        self.lbl_ip_selected_count = ctk.CTkLabel(select_frame, text="已选择: 0", font=("Arial", 12))
+        self.lbl_ip_selected_count.pack(side='left', padx=20)
 
         # IP List View (Treeview)
         list_frame = ctk.CTkFrame(parent)
         list_frame.pack(fill='both', expand=True, padx=12, pady=8)
         
-        columns = ("host", "port", "user", "pass", "protocol", "status", "updated")
+        columns = ("checkbox", "host", "port", "user", "pass", "protocol", "history", "status", "updated")
         self.ip_tree = ttk.Treeview(list_frame, columns=columns, show="headings", selectmode="extended")
+        self.ip_tree.heading("checkbox", text="☐")
         self.ip_tree.heading("host", text="Host/IP")
         self.ip_tree.heading("port", text="Port")
         self.ip_tree.heading("user", text="User")
         self.ip_tree.heading("pass", text="Password")
         self.ip_tree.heading("protocol", text="Protocol")
+        self.ip_tree.heading("history", text="以前用过")
         self.ip_tree.heading("status", text="使用状态")
         self.ip_tree.heading("updated", text="最后更新")
         
+        self.ip_tree.column("checkbox", width=40, anchor="center")
         self.ip_tree.column("host", width=150)
         self.ip_tree.column("port", width=80)
         self.ip_tree.column("user", width=100)
         self.ip_tree.column("pass", width=100)
         self.ip_tree.column("protocol", width=80)
+        self.ip_tree.column("history", width=100)
         self.ip_tree.column("status", width=120)
         self.ip_tree.column("updated", width=150)
+        
+        # Bind checkbox click
+        self.ip_tree.bind('<Button-1>', self.on_ip_tree_click)
+        
+        # Init selected set
+        self._selected_ips = set()
         
         vsb = ttk.Scrollbar(list_frame, orient="vertical", command=self.ip_tree.yview)
         hsb = ttk.Scrollbar(list_frame, orient="horizontal", command=self.ip_tree.xview)
         self.ip_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        try:
+            self.ip_tree.tag_configure("duplicate_row", background="#330000", foreground="#FF5555")
+        except Exception:
+            pass
         
         self.ip_tree.grid(row=0, column=0, sticky='nsew')
         vsb.grid(row=0, column=1, sticky='ns')
@@ -630,6 +688,7 @@ class App(*BaseClasses):
             
         all_ips = self.ip_manager.get_all_ips()
         max_u = self.ip_manager.get_max_usage()
+        dup_set = set(self.ip_manager.get_last_import_duplicates())
         
         # Insert
         # Show only first 500 to avoid UI lag if too many
@@ -641,21 +700,148 @@ class App(*BaseClasses):
             used_count = len(ip.get('used_by', []))
             status_text = f"已用: {used_count}/{max_u}"
             
-            # Simple color logic? Treeview doesn't support easy row colors without tags.
-            # We can use tags.
-            
             updated_ts = ip.get('last_updated', 0)
             updated_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(updated_ts)) if updated_ts > 0 else "-"
             
-            self.ip_tree.insert("", "end", values=(
+            # Checkbox logic
+            host = ip.get('host', '')
+            port = str(ip.get('port', ''))
+            checkbox_val = "☑" if host in self._selected_ips else "☐"
+            history_text = "已用过" if used_count > 0 else "-"
+            row_values = (
+                checkbox_val,
                 ip['host'], 
                 ip['port'], 
                 ip.get('proxyUserName', ''), 
                 ip.get('proxyPassword', ''),
                 ip.get('protocol', 'socks5'),
+                history_text,
                 status_text,
                 updated_str
-            ))
+            )
+            tags = ()
+            if (host, port) in dup_set:
+                row_values = (
+                    checkbox_val,
+                    ip['host'],
+                    ip['port'],
+                    ip.get('proxyUserName', ''),
+                    ip.get('proxyPassword', ''),
+                    ip.get('protocol', 'socks5'),
+                    "重复",
+                    status_text,
+                    updated_str
+                )
+                tags = ("duplicate_row",)
+            self.ip_tree.insert("", "end", values=row_values, tags=tags)
+            
+        # Update label
+        if hasattr(self, 'lbl_ip_selected_count'):
+            self.lbl_ip_selected_count.configure(text=f"已选择: {len(self._selected_ips)}")
+
+    def export_ips(self):
+        # ... existing export code ...
+        pass
+
+    # --- IP Selection Helpers ---
+
+    def on_ip_tree_click(self, event):
+        """Handle click on IP tree, specifically for checkbox column."""
+        region = self.ip_tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+            
+        column = self.ip_tree.identify_column(event.x)
+        if column != '#1':  # First column is checkbox
+            return
+            
+        item = self.ip_tree.identify_row(event.y)
+        if not item:
+            return
+            
+        values = self.ip_tree.item(item, 'values')
+        if not values or len(values) < 2:
+            return
+            
+        # host is second column (#2), index 1 in values tuple
+        host = values[1]
+        
+        # Toggle selection
+        if host in self._selected_ips:
+            self._selected_ips.discard(host)
+        else:
+            self._selected_ips.add(host)
+        
+        # Update checkbox display
+        checkbox_val = "☑" if host in self._selected_ips else "☐"
+        new_values = (checkbox_val,) + values[1:]
+        self.ip_tree.item(item, values=new_values)
+        
+        # Update count label
+        if hasattr(self, 'lbl_ip_selected_count'):
+            self.lbl_ip_selected_count.configure(text=f"已选择: {len(self._selected_ips)}")
+        
+        return "break"
+
+    def select_all_ips(self):
+        """Select all visible IPs."""
+        self._selected_ips.clear()
+        all_ips = self.ip_manager.get_all_ips()
+        for ip in all_ips:
+            host = ip.get('host')
+            if host:
+                self._selected_ips.add(host)
+        
+        self.refresh_ip_list()
+        self.append_log(f"已全选 {len(self._selected_ips)} 个IP")
+
+    def deselect_all_ips(self):
+        """Deselect all IPs."""
+        count = len(self._selected_ips)
+        self._selected_ips.clear()
+        self.refresh_ip_list()
+        if count > 0:
+            self.append_log(f"已取消选择 {count} 个IP")
+
+    def invert_ip_selection(self):
+        """Invert IP selection."""
+        all_ips = self.ip_manager.get_all_ips()
+        current_selection = self._selected_ips.copy()
+        self._selected_ips.clear()
+        
+        count = 0
+        for ip in all_ips:
+            host = ip.get('host')
+            if host and host not in current_selection:
+                self._selected_ips.add(host)
+                count += 1
+        
+        self.refresh_ip_list()
+        self.append_log(f"已反选，当前选中 {len(self._selected_ips)} 个IP")
+
+    def delete_selected_ips(self):
+        """Delete selected IPs with confirmation."""
+        if not self._selected_ips:
+            messagebox.showwarning("提示", "请先选择要删除的IP")
+            return
+            
+        count = len(self._selected_ips)
+        if not messagebox.askyesno("确认删除", f"确定要删除选中的 {count} 个IP吗？\n此操作不可恢复。"):
+            return
+            
+        try:
+            # Convert set to list
+            hosts_to_delete = list(self._selected_ips)
+            deleted_count = self.ip_manager.batch_delete_ips(hosts_to_delete)
+            
+            self._selected_ips.clear()
+            self.reload_ip_config()
+            
+            messagebox.showinfo("删除成功", f"成功删除 {deleted_count} 个IP")
+            self.append_log(f"批量删除了 {deleted_count} 个IP")
+            
+        except Exception as e:
+            messagebox.showerror("删除失败", f"操作失败: {e}")
 
     def import_ips_dialog(self):
         # Simple dialog to paste or load file
@@ -695,7 +881,7 @@ class App(*BaseClasses):
         ctk.CTkLabel(header_frame, text="批量导入IP", font=("Arial", 18, "bold")).pack(side='left')
         
         # Instruction
-        ctk.CTkLabel(main_frame, text="请粘贴IP列表 (格式: host:port:user:pass 或 host ...)", 
+        ctk.CTkLabel(main_frame, text="请粘贴IP列表 (支持自动换行，非法IP/域名会标红)", 
                    font=("Arial", 14), text_color="gray").pack(anchor='w', padx=15, pady=(5, 5))
         
         # Text Area with border effect
@@ -705,8 +891,87 @@ class App(*BaseClasses):
         text_area = ctk.CTkTextbox(text_container, font=("Arial", 13), border_width=2, corner_radius=6)
         text_area.pack(fill='both', expand=True)
         text_area.focus_set()
+
+        # Access underlying Tkinter Text widget for advanced features
+        tk_text = text_area._textbox
+        
+        # Configure tag for invalid lines
+        tk_text.tag_config("invalid_line", background="#FFEBEB", foreground="#D00000")
+        if ctk.get_appearance_mode() == "Dark":
+            tk_text.tag_config("invalid_line", background="#550000", foreground="#FF5555")
+
+        def validate_line(line_content):
+            line_content = line_content.strip()
+            if not line_content:
+                return True # Empty lines are neutral
+                
+            # Extract host (first part before separators)
+            parts = re.split(r'[:,\s|\t]+', line_content)
+            host = parts[0]
+            
+            try:
+                ipaddress.ip_address(host)
+                return True
+            except ValueError:
+                if re.match(r'^[A-Za-z0-9.-]+$', host):
+                    return True
+                return False
+
+        def check_content(event=None):
+            tk_text.tag_remove("invalid_line", "1.0", "end")
+            
+            full_text = tk_text.get("1.0", "end-1c")
+            lines = full_text.split('\n')
+            
+            has_error = False
+            for i, line in enumerate(lines):
+                if not validate_line(line):
+                    # Apply tag to this line
+                    start = f"{i+1}.0"
+                    end = f"{i+1}.0 lineend"
+                    tk_text.tag_add("invalid_line", start, end)
+                    has_error = True
+            
+            return has_error
+
+        def on_key_release(event):
+            check_content()
+            
+        def on_delimiter_key(event):
+            tk_text.insert("insert", "\n")
+            check_content()
+            return "break"
+            
+        def on_paste(event):
+            try:
+                content = top.clipboard_get()
+                # Replace common delimiters with newlines
+                formatted = re.sub(r'[ ,;，]+', '\n', content)
+                # Normalize newlines and trim
+                formatted_lines = [line.strip() for line in formatted.splitlines() if line.strip()]
+                formatted_text = "\n".join(formatted_lines)
+                
+                tk_text.insert("insert", formatted_text)
+                check_content()
+                return "break"
+            except Exception:
+                pass
+
+        # Bindings
+        tk_text.bind("<KeyRelease>", on_key_release)
+        tk_text.bind("<space>", on_delimiter_key)
+        tk_text.bind("<comma>", on_delimiter_key)
+        tk_text.bind("，", on_delimiter_key)
+        tk_text.bind(";", on_delimiter_key)
+        tk_text.bind("；", on_delimiter_key)
+        tk_text.bind("<Return>", lambda e: check_content())
+        tk_text.bind("<<Paste>>", on_paste)
         
         def do_import():
+            if check_content():
+                messagebox.showerror("格式错误", "存在非法IP/域名格式（已标红），请修正后再导入。\n\n每行支持 host 或 host:port:user:pass。")
+                return
+
             content = text_area.get("1.0", "end").strip()
             if not content:
                 return
@@ -760,9 +1025,9 @@ class App(*BaseClasses):
         count = 0
         for item in selection:
             vals = self.ip_tree.item(item, "values")
-            # vals: (Host, Port, User, Protocol, Usage, Max, Status)
-            host = vals[0]
-            port = vals[1]
+            # 当前列顺序: (checkbox, host, port, user, pass, protocol, history, status, updated)
+            host = vals[1]
+            port = vals[2]
             self.ip_manager.update_ip_usage(host, port, new_count)
             count += 1
             
@@ -842,6 +1107,7 @@ class App(*BaseClasses):
         self.cnt_fail_var.set(str(fail))
 
     def append_log(self, s: str):
+        self._last_worker_heartbeat = time.time()
         prefix = ""
         s_lower = s.lower()
         if any(k in s_lower for k in ["fail", "error", "exception", "失败", "异常", "错误"]):
@@ -914,6 +1180,9 @@ class App(*BaseClasses):
         self.lbl_email_unused = ctk.CTkLabel(cnt_frame, text="未使用: 0", font=("Arial", 14, "bold"), text_color="#2cc985")
         self.lbl_email_unused.pack(side='left', padx=15)
         
+        self.lbl_email_problem = ctk.CTkLabel(cnt_frame, text="问题: 0", font=("Arial", 14, "bold"), text_color="#FF8C00")
+        self.lbl_email_problem.pack(side='left', padx=15)
+        
         # Right: Progress Bar
         prog_frame = ctk.CTkFrame(stats_frame, fg_color="transparent")
         prog_frame.pack(side='right', fill='x', expand=True, padx=20)
@@ -943,12 +1212,13 @@ class App(*BaseClasses):
         # ctk.CTkButton(tool_frame, text="导出为注册任务CSV", command=self.export_emails_to_csv).pack(side='left', padx=6) # Removed
         # Restore Refresh Button as 'Refresh View' (Does not change state)
         ctk.CTkButton(tool_frame, text="刷新视图", command=self.refresh_email_view_only).pack(side='left', padx=6)
+        ctk.CTkButton(tool_frame, text="导出问题邮箱", command=self.export_problem_emails, fg_color="#FF8C00", hover_color="#CC7000").pack(side='left', padx=6)
         
         # Add Clear Button
         ctk.CTkButton(tool_frame, text="清空邮箱", command=self.clear_emails_dialog, fg_color="#ff4d4d", hover_color="#d63030").pack(side='right', padx=6)
         
         # Legend
-        ctk.CTkLabel(tool_frame, text="图例: ✅ 可用  🏁 已用  ❌ 无效  ⏳ 进行中  ⚠️ 失败", font=("Arial", 12)).pack(side='right', padx=10)
+        ctk.CTkLabel(tool_frame, text="图例: ✅ 可用  🏁 已用  ❌ 无效  ⏳ 进行中  ⚠️ 失败  🔶 问题邮箱", font=("Arial", 12)).pack(side='right', padx=10)
 
         # Search Bar
         search_frame = ctk.CTkFrame(parent)
@@ -958,7 +1228,16 @@ class App(*BaseClasses):
         self.email_search_entry = ctk.CTkEntry(search_frame, textvariable=self.email_search_var, width=300, placeholder_text="输入邮箱地址...")
         self.email_search_entry.pack(side='left', padx=6)
         ctk.CTkButton(search_frame, text="查找/获取验证码地址", command=self.search_email_url).pack(side='left', padx=6)
-        ctk.CTkButton(search_frame, text="删除选中", command=self.delete_selected_email, fg_color="red").pack(side='left', padx=6)
+        ctk.CTkButton(search_frame, text="批量删除", command=self.batch_delete_emails, fg_color="red", hover_color="#d63030").pack(side='left', padx=6)
+        
+        # Selection Frame
+        select_frame = ctk.CTkFrame(parent)
+        select_frame.pack(fill='x', padx=12, pady=(0, 8))
+        ctk.CTkButton(select_frame, text="全选", command=self.select_all_emails, width=80).pack(side='left', padx=6)
+        ctk.CTkButton(select_frame, text="取消全选", command=self.deselect_all_emails, width=80).pack(side='left', padx=6)
+        ctk.CTkButton(select_frame, text="反选", command=self.invert_email_selection, width=80).pack(side='left', padx=6)
+        self.lbl_selected_count = ctk.CTkLabel(select_frame, text="已选择: 0", font=("Arial", 12))
+        self.lbl_selected_count.pack(side='left', padx=20)
         
         # Data Preview (Table-like using Textbox for now, or Treeview if possible)
         # CustomTkinter doesn't have a Grid/Table widget natively. Using Treeview within a Frame.
@@ -966,17 +1245,19 @@ class App(*BaseClasses):
         list_frame = ctk.CTkFrame(parent)
         list_frame.pack(fill='both', expand=True, padx=12, pady=8)
         
-        # Treeview for Emails
-        columns = ("email", "password", "auth_code", "status")
+        # Treeview for Emails (with checkbox column)
+        columns = ("checkbox", "email", "password", "auth_code", "status")
         self.email_tree = ttk.Treeview(list_frame, columns=columns, show="headings", selectmode="extended")
+        self.email_tree.heading("checkbox", text="☐")
         self.email_tree.heading("email", text="邮箱账号")
         self.email_tree.heading("password", text="密码")
         self.email_tree.heading("auth_code", text="授权码")
         self.email_tree.heading("status", text="使用状态")
         
+        self.email_tree.column("checkbox", width=40, anchor="center")
         self.email_tree.column("email", width=200)
         self.email_tree.column("password", width=120)
-        self.email_tree.column("auth_code", width=300)
+        self.email_tree.column("auth_code", width=280)
         self.email_tree.column("status", width=80)
         
         # Configure tags for colors
@@ -985,17 +1266,25 @@ class App(*BaseClasses):
         self.email_tree.tag_configure('invalid', foreground='#FF0000')  # Red (Invalid/Banned)
         self.email_tree.tag_configure('processing', foreground='#0000FF')  # Blue (Processing)
         self.email_tree.tag_configure('failed', foreground='#FFA500')  # Orange (Failed)
+        self.email_tree.tag_configure('problem', foreground='#FF8C00')  # Dark Orange (Problem - Captcha Failed)
         
         # Bind double click for links
         self.email_tree.bind('<Double-1>', self.on_tree_double_click)
+        
+        # Bind checkbox column click
+        self.email_tree.bind('<Button-1>', self.on_email_tree_click)
+        
+        # Track selected emails via checkbox
+        self._selected_emails = set()
         
         # Context Menu
         self.email_context_menu = tkinter.Menu(self, tearoff=0)
         self.email_context_menu.add_command(label="标记为: 可用 (New)", command=lambda: self.mark_selected_status("new"))
         self.email_context_menu.add_command(label="标记为: 已用 (Used)", command=lambda: self.mark_selected_status("used"))
-        self.email_context_menu.add_command(label="标记为: 无效 (Invalid)", command=lambda: self.mark_selected_status("invalid"))
+        # self.email_context_menu.add_command(label="标记为: 无效 (Invalid)", command=lambda: self.mark_selected_status("invalid"))
+        self.email_context_menu.add_command(label="标记为: 问题邮箱 (Problem)", command=lambda: self.mark_selected_status("problem"))
         self.email_context_menu.add_separator()
-        self.email_context_menu.add_command(label="删除选中", command=self.delete_selected_email)
+        self.email_context_menu.add_command(label="删除选中", command=self.batch_delete_emails)
         
         # Bind Right Click
         if platform.system() == "Darwin":
@@ -1130,10 +1419,11 @@ class App(*BaseClasses):
             email_stats = self.email_pool.get_stats(mode_filter=current_mode)
             total_emails = email_stats.get('total_emails', 0)
             used_emails = email_stats.get('used_emails', 0)
+            problem_emails = email_stats.get('problem_emails', 0)
             # Note: The 'used_emails_count' from ip_stats is different (emails used by IPs). 
             # The user wants "used emails" in Email Pool tab, which is based on email status.
             
-            available_emails = max(0, total_emails - used_emails)
+            available_emails = max(0, total_emails - used_emails - problem_emails)
             
             if hasattr(self, 'home_email_stat_label'):
                 self.home_email_stat_label.configure(text=f"{available_emails}")
@@ -1143,6 +1433,8 @@ class App(*BaseClasses):
                 self.lbl_email_used.configure(text=f"已使用: {used_emails}")
             if hasattr(self, 'lbl_email_unused'):
                 self.lbl_email_unused.configure(text=f"未使用: {available_emails}")
+            if hasattr(self, 'lbl_email_problem'):
+                self.lbl_email_problem.configure(text=f"问题: {problem_emails}")
             if hasattr(self, 'email_progress'):
                 if total_emails > 0:
                     ratio = used_emails / total_emails
@@ -1345,6 +1637,9 @@ class App(*BaseClasses):
             elif status_val in ('failed', 'error', 'stopped'):
                 status = "⚠️ 失败"
                 tags = ('failed',)
+            elif status_val == 'problem':
+                status = "🔶 问题邮箱"
+                tags = ('problem',)
             else:
                 # Fallback for unknown statuses
                 status = f"❓ {status_val}"
@@ -1354,9 +1649,16 @@ class App(*BaseClasses):
             auth = e.get('auth_code', '')
             if auth.startswith('enc:'):
                 auth = "******"
-
-            self.email_tree.insert("", "end", values=(e['email'], e['password'], auth, status), tags=tags)
+            
+            # Checkbox state
+            checkbox_val = "☑" if e['email'] in self._selected_emails else "☐"
+            
+            self.email_tree.insert("", "end", values=(checkbox_val, e['email'], e['password'], auth, status), tags=tags)
             count += 1
+            
+        # Update selected count label
+        if hasattr(self, 'lbl_selected_count'):
+            self.lbl_selected_count.configure(text=f"已选择: {len(self._selected_emails)}")
             
     def on_tree_double_click(self, event):
         item = self.email_tree.identify('item', event.x, event.y)
@@ -1400,22 +1702,34 @@ class App(*BaseClasses):
             self.email_context_menu.grab_release()
 
     def mark_selected_status(self, status):
-        selected = self.email_tree.selection()
-        if not selected:
+        # Prioritize checkbox selection
+        emails_to_process = list(self._selected_emails)
+        
+        # Fallback to highlight selection if no checkboxes checked
+        if not emails_to_process:
+            selected_items = self.email_tree.selection()
+            for item in selected_items:
+                vals = self.email_tree.item(item)['values']
+                if vals and len(vals) > 1:
+                    emails_to_process.append(vals[1])
+        
+        if not emails_to_process:
+            messagebox.showinfo("提示", "请先选择要标记的邮箱")
             return
         
         count = 0
-        for item in selected:
-            vals = self.email_tree.item(item)['values']
-            if vals:
-                email = vals[0]
-                self.email_pool.update_status(email, status)
-                count += 1
+        for email in emails_to_process:
+            self.email_pool.update_status(email, status)
+            count += 1
         
         if count > 0:
+            # Clear selection to avoid confusion, or keep it?
+            # Batch operations usually suggest clearing.
+            self._selected_emails.clear()
+            
             self._update_email_list_ui()
             self.trigger_refresh(force=True)
-            status_map = {'new': '可用', 'used': '已用', 'invalid': '无效'}
+            status_map = {'new': '可用', 'used': '已用', 'problem': '问题邮箱'}
             self.append_log(f"已将 {count} 个邮箱标记为 {status_map.get(status, status)}")
 
     def drop_import_emails(self, event):
@@ -1457,6 +1771,42 @@ class App(*BaseClasses):
             self.trigger_refresh()  # Update stats
             self.append_log("已清空所有邮箱数据")
 
+    def export_problem_emails(self):
+        """导出问题邮箱（验证码获取失败的邮箱）到CSV文件。"""
+        problem_emails = []
+        for e in self.email_pool.get_all_rows():
+            if e.get('status', '').lower() == 'problem':
+                problem_emails.append(e)
+        
+        if not problem_emails:
+            messagebox.showinfo("提示", "没有问题邮箱需要导出")
+            return
+        
+        p = filedialog.asksaveasfilename(
+            defaultextension=".csv", 
+            filetypes=[('CSV', '*.csv')],
+            initialfile="problem_emails.csv"
+        )
+        if p:
+            try:
+                with open(p, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    # Write header
+                    writer.writerow(['email', 'password', 'auth_code', 'status', 'failure_reason', 'failure_time'])
+                    # Write problem emails
+                    for e in problem_emails:
+                        writer.writerow([
+                            e['email'],
+                            e.get('password', ''),
+                            e.get('auth_code', ''),
+                            e.get('status', 'problem'),
+                            e.get('failure_reason', ''),
+                            e.get('failure_time', '')
+                        ])
+                self.append_log(f"已导出 {len(problem_emails)} 个问题邮箱到: {p}")
+                messagebox.showinfo("导出成功", f"成功导出 {len(problem_emails)} 个问题邮箱")
+            except Exception as e:
+                messagebox.showerror("导出失败", f"导出问题邮箱时出错: {e}")
 
     def search_email_url(self):
         query = self.email_search_var.get().strip()
@@ -1491,27 +1841,177 @@ class App(*BaseClasses):
         else:
             messagebox.showerror("未找到", f"邮箱池中未找到: {query}")
 
-    def delete_selected_email(self):
-        selected = self.email_tree.selection()
-        if not selected:
-            return
-        
-        if not messagebox.askyesno("确认", f"确定要删除选中的 {len(selected)} 个邮箱吗？"):
+    def on_email_tree_click(self, event):
+        """Handle click on email tree, specifically for checkbox column."""
+        region = self.email_tree.identify("region", event.x, event.y)
+        if region != "cell":
             return
             
-        count = 0
-        for item in selected:
-            vals = self.email_tree.item(item)['values']
-            if vals:
-                email = vals[0]  # email is first column
-                self.email_pool.delete_email(email)
-                count += 1
+        column = self.email_tree.identify_column(event.x)
+        if column != '#1':  # First column is checkbox
+            return
+            
+        item = self.email_tree.identify_row(event.y)
+        if not item:
+            return
+            
+        values = self.email_tree.item(item, 'values')
+        if not values or len(values) < 2:
+            return
+            
+        email = values[1]  # email is second column now (after checkbox)
+        
+        # Toggle selection
+        if email in self._selected_emails:
+            self._selected_emails.discard(email)
+        else:
+            self._selected_emails.add(email)
+        
+        # Update the checkbox display
+        checkbox_val = "☑" if email in self._selected_emails else "☐"
+        new_values = (checkbox_val,) + values[1:]
+        self.email_tree.item(item, values=new_values)
+        
+        # Update count label
+        if hasattr(self, 'lbl_selected_count'):
+            self.lbl_selected_count.configure(text=f"已选择: {len(self._selected_emails)}")
+        
+        # Prevent default selection behavior when clicking checkbox
+        return "break"
+
+    def select_all_emails(self):
+        """Select all visible emails in the current mode."""
+        self._selected_emails.clear()
+        
+        # Get all visible emails based on current filter
+        emails = self.email_pool.get_all_rows()
+        current_mode = self.email_mode_var.get()
+        query = self.email_search_var.get().strip().lower()
+        
+        for e in emails:
+            email_addr = e['email']
+            auth_chk = e.get('auth_code', '')
+            is_xinlan = auth_chk.startswith('http')
+            
+            # Apply mode filter
+            if current_mode == "心蓝模式" and not is_xinlan:
+                continue
+            if current_mode == "IMAP模式" and is_xinlan:
+                continue
+            
+            # Apply search filter
+            if query and query not in email_addr.lower():
+                continue
+                
+            self._selected_emails.add(email_addr)
         
         self._update_email_list_ui()
-        self.refresh_home_stats()
-        msg = f"已成功删除 {count} 个邮箱"
-        self.append_log(msg)
-        messagebox.showinfo("删除成功", msg)
+        self.append_log(f"已全选 {len(self._selected_emails)} 个邮箱")
+
+    def deselect_all_emails(self):
+        """Clear all email selections."""
+        count = len(self._selected_emails)
+        self._selected_emails.clear()
+        self._update_email_list_ui()
+        if count > 0:
+            self.append_log(f"已取消选择 {count} 个邮箱")
+
+    def invert_email_selection(self):
+        """Invert the current selection."""
+        # Get all visible emails
+        emails = self.email_pool.get_all_rows()
+        current_mode = self.email_mode_var.get()
+        query = self.email_search_var.get().strip().lower()
+        
+        visible_emails = set()
+        for e in emails:
+            email_addr = e['email']
+            auth_chk = e.get('auth_code', '')
+            is_xinlan = auth_chk.startswith('http')
+            
+            if current_mode == "心蓝模式" and not is_xinlan:
+                continue
+            if current_mode == "IMAP模式" and is_xinlan:
+                continue
+            if query and query not in email_addr.lower():
+                continue
+                
+            visible_emails.add(email_addr)
+        
+        # Invert selection
+        self._selected_emails = visible_emails - self._selected_emails
+        self._update_email_list_ui()
+        self.append_log(f"已反选，当前选择 {len(self._selected_emails)} 个邮箱")
+
+    def batch_delete_emails(self):
+        """Batch delete selected emails with confirmation dialog."""
+        # Get selected emails from checkbox selection
+        selected_emails = list(self._selected_emails)
+        
+        if not selected_emails:
+            # Fallback to tree selection (for keyboard/legacy selection)
+            selected_items = self.email_tree.selection()
+            if selected_items:
+                for item in selected_items:
+                    vals = self.email_tree.item(item, 'values')
+                    if vals and len(vals) > 1:
+                        selected_emails.append(vals[1])  # email is second column
+        
+        if not selected_emails:
+            messagebox.showwarning("提示", "请先选择要删除的邮箱（点击第一列的复选框）")
+            return
+        
+        # Show confirmation dialog
+        if not messagebox.askyesno("确认删除", 
+                                   f"确定要删除选中的 {len(selected_emails)} 个邮箱吗？\n\n"
+                                   f"此操作不可恢复！"):
+            return
+        
+        # Perform batch deletion using EmailPool's batch method
+        try:
+            result = self.email_pool.batch_delete_emails(selected_emails)
+            
+            # Clear selection for successfully deleted emails
+            for email in selected_emails:
+                if email not in [f[0] for f in result['failed']]:
+                    self._selected_emails.discard(email)
+            
+            # Refresh UI
+            self._update_email_list_ui()
+            self.trigger_refresh(force=True)
+            
+            # Show result
+            failed = result['failed']
+            success_count = result['deleted_count']
+            
+            if failed:
+                error_details = "\n".join([f"{email}: {reason}" for email, reason in failed[:10]])
+                if len(failed) > 10:
+                    error_details += f"\n... 还有 {len(failed) - 10} 个邮箱删除失败"
+                
+                if success_count > 0:
+                    messagebox.showwarning("部分删除成功", 
+                                           f"成功删除 {success_count} 个邮箱，{len(failed)} 个失败\n\n"
+                                           f"失败详情:\n{error_details}")
+                else:
+                    messagebox.showerror("删除失败", 
+                                         f"所有邮箱删除失败\n\n失败详情:\n{error_details}")
+                
+                self.append_log(f"批量删除完成: 成功 {success_count} 个, 失败 {len(failed)} 个")
+            else:
+                msg = f"成功删除 {success_count} 个邮箱"
+                self.append_log(msg)
+                messagebox.showinfo("删除成功", msg)
+                
+        except Exception as e:
+            error_msg = f"批量删除时发生错误: {str(e)}"
+            self.append_log(f"❌ {error_msg}")
+            messagebox.showerror("删除失败", error_msg)
+
+    def delete_selected_email(self):
+        """Delete single selected email (legacy method, kept for compatibility)."""
+        # Use batch delete for consistency
+        self.batch_delete_emails()
 
     def start_registration(self):
         if self.worker and self.worker.is_alive():
@@ -1587,6 +2087,7 @@ class App(*BaseClasses):
             return
             
         self.stop_event.clear()
+        self._reset_force_terminate_flag()
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="normal")
         
@@ -1650,6 +2151,29 @@ class App(*BaseClasses):
                     done.wait()
                     return out['action']
 
+                # Registration events for handling failures (especially captcha-related)
+                def on_registration_failure(email: str, reason: str):
+                    """Handle registration failure - mark email as problem if captcha-related."""
+                    # Check if failure is captcha-related
+                    captcha_errors = ['code_not_found', 'code_input_not_visible', 'code_input_error']
+                    if any(err in reason.lower() for err in captcha_errors):
+                        self.append_log(f"邮箱 {email} 因验证码问题被标记为问题邮箱: {reason}")
+                        self.email_pool.update_status(email, 'problem')
+                
+                def on_registration_success(email: str):
+                    """Handle registration success."""
+                    pass  # Success is handled by progress callback
+                
+                def on_registration_finish(email: str, success: bool, message: str):
+                    """Handle registration finish (called after all retries)."""
+                    pass
+
+                events = RegistrationEvents(
+                    on_success=on_registration_success,
+                    on_failure=on_registration_failure,
+                    on_finish=on_registration_finish
+                )
+
                 run_batch(
                     *args, 
                     logger=self.append_log, 
@@ -1660,7 +2184,8 @@ class App(*BaseClasses):
                     target_success_count=target_count,
                     email_pool=self.email_pool,
                     headless_mode=self.headless_mode_var.get(),
-                    udp_enabled=self.udp_var.get()
+                    udp_enabled=self.udp_var.get(),
+                    events=events
                 )
                 self.append_log("任务结束")
             except Exception as e:
@@ -1698,6 +2223,34 @@ class App(*BaseClasses):
         self.worker = threading.Thread(target=run, daemon=True)
         self.worker.start()
 
+    def _force_terminate_worker(self):
+        """强制终止工作线程（保底策略）。"""
+        if not self.worker or not self.worker.is_alive():
+            return False
+        
+        self.append_log("⚠️ 正在强制终止工作线程...")
+        try:
+            # 使用 ctypes 强制在工作线程中抛出异常
+            # 这是一个危险操作，但作为保底策略使用
+            import ctypes
+            thread_id = self.worker.ident
+            if thread_id:
+                res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                    ctypes.c_long(thread_id), 
+                    ctypes.py_object(SystemExit)
+                )
+                if res > 1:
+                    # 如果影响多个线程，撤销操作
+                    ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(thread_id), None)
+                    self.append_log("⚠️ 强制终止可能影响多个线程，已撤销")
+                    return False
+                elif res == 1:
+                    self.append_log("✅ 已发送终止信号到工作线程")
+                    return True
+        except Exception as e:
+            self.append_log(f"❌ 强制终止失败: {e}")
+        return False
+
     def stop_registration(self):
         if not self.worker or not self.worker.is_alive():
             return
@@ -1706,6 +2259,35 @@ class App(*BaseClasses):
             self.stop_event.set()
             self.btn_stop.configure(state="disabled")
             self.append_log("正在停止任务...")
+            
+            # 启动守护线程监控停止过程
+            def monitor_stop():
+                wait_time = 0
+                max_wait = 15  # 最多等待15秒
+                while wait_time < max_wait and self.worker and self.worker.is_alive():
+                    time.sleep(1)
+                    wait_time += 1
+                    if wait_time % 5 == 0:
+                        self._run_on_ui(lambda: self.append_log(f"⏳ 等待任务停止... {wait_time}s"))
+                
+                if self.worker and self.worker.is_alive():
+                    # 正常停止失败，尝试强制终止
+                    self._run_on_ui(self._force_terminate_worker)
+                    time.sleep(1)
+                    
+                    if self.worker and self.worker.is_alive():
+                        self._run_on_ui(lambda: self.append_log("❌ 强制终止失败，请重启程序"))
+                        self._run_on_ui(lambda: messagebox.showerror(
+                            "停止失败", 
+                            "任务无法正常停止，建议重启程序。\n长时间阻塞可能是由于网络或浏览器驱动卡死。"
+                        ))
+                
+                # 恢复UI状态
+                self._run_on_ui(lambda: self.btn_start.configure(state="normal"))
+                if hasattr(self, 'lbl_task_status'):
+                    self._run_on_ui(lambda: self.lbl_task_status.configure(text="状态：已停止"))
+            
+            threading.Thread(target=monitor_stop, daemon=True).start()
 
     def import_config(self):
         p = filedialog.askopenfilename(filetypes=[('JSON', '*.json')])

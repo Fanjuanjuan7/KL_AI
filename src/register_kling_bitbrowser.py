@@ -3,8 +3,10 @@ import os
 import re
 import time
 import threading
+import socket
 import psutil
 import socks
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple, Callable
 from dataclasses import dataclass
@@ -21,6 +23,10 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service
 
+# 设置全局 socket 超时，防止网络操作无限阻塞
+default_socket_timeout = 30
+socket.setdefaulttimeout(default_socket_timeout)
+
 try:
     from src.captcha_receiver import MailExtractor
     from src.email_pool import EmailPool
@@ -34,15 +40,15 @@ except ImportError:
 # =============================================================================
 
 # Time constants (in seconds)
-DEFAULT_TIMEOUT_SEC = 120
+DEFAULT_TIMEOUT_SEC = 90  # 降低超时到90秒，避免长时间阻塞
 DEFAULT_POLL_INTERVAL_SEC = 0.5
 PAGE_READY_TIMEOUT_SEC = 12
-CONNECTIVITY_MAX_WAIT_SEC = 20
+CONNECTIVITY_MAX_WAIT_SEC = 30  # 增加网络检测等待时间
 SLIDER_MAX_WAIT_SEC = 60
 CODE_EXTRACTION_TIMEOUT_SEC = 400
-BROWSER_START_WAIT_SEC = 5
+BROWSER_START_WAIT_SEC = 8  # 增加启动等待时间到8秒
 POST_SLIDER_WAIT_SEC = 5
-POST_SUBMIT_WAIT_SEC = 3
+POST_SUBMIT_WAIT_SEC = 5  # 改为5秒，确保页面跳转完成
 
 # Time constants (in milliseconds)
 DEFAULT_TIMEOUT_MS = 100000
@@ -184,13 +190,24 @@ class StepRunner:
             
         t0 = time.time()
         try:
-            with ThreadPoolExecutor(max_workers=1) as executor:
+            # Avoid using 'with' context manager which enforces wait=True on exit
+            executor = ThreadPoolExecutor(max_workers=1)
+            try:
                 future = executor.submit(func)
                 res = future.result(timeout=timeout)
+                executor.shutdown(wait=True)
                 return res
+            except TimeoutError:
+                if self.logger:
+                    self.logger(f"阶段 {name} 超时 ({timeout}s)")
+                # Force shutdown without waiting for the stuck thread
+                executor.shutdown(wait=False)
+                raise RuntimeError(f"Step {name} timed out")
+            except Exception:
+                executor.shutdown(wait=False)
+                raise
         except TimeoutError:
-            if self.logger:
-                self.logger(f"阶段 {name} 超时 ({timeout}s)")
+            # Re-raise nicely formatted error
             raise RuntimeError(f"Step {name} timed out")
         except Exception as e:
             if self.logger:
@@ -291,31 +308,47 @@ class BitBrowserClient:
         method: str, 
         endpoint: str, 
         data: Optional[Dict[str, Any]] = None, 
-        timeout: int = 30
+        timeout: int = 60,  # 增加默认超时到60秒
+        max_retries: int = 3  # 默认重试3次
     ) -> requests.Response:
+        """增强版请求方法，支持自动重试和更好的错误处理。"""
         url = f"{self.base_url}{endpoint}"
-        try:
-            t0 = time.time()
-            if method.upper() == 'POST':
-                r = self.session.post(url, headers=self._headers(), data=json.dumps(data) if data else None, timeout=timeout)
-            else:
-                r = self.session.get(url, headers=self._headers(), timeout=timeout)
-            
-            # Log slow requests
-            elapsed = time.time() - t0
-            if elapsed > 1.0:
-                 print(f"Slow BitBrowser API: {method} {endpoint} took {elapsed:.2f}s")
+        last_exception = None
+        
+        for attempt in range(max_retries):
+            try:
+                t0 = time.time()
+                if method.upper() == 'POST':
+                    r = self.session.post(url, headers=self._headers(), data=json.dumps(data) if data else None, timeout=timeout)
+                else:
+                    r = self.session.get(url, headers=self._headers(), timeout=timeout)
+                
+                # Log slow requests
+                elapsed = time.time() - t0
+                if elapsed > 1.0:
+                     print(f"Slow BitBrowser API: {method} {endpoint} took {elapsed:.2f}s")
 
-            if r.status_code == 405:
-                print(f"HTTP 405 Method Not Allowed: {method} {url}")
-            r.raise_for_status()
-            return r
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 405:
-                print(f"HTTP 405 Error Details: {method} {url} - {e.response.text}")
-            raise e
-        except requests.exceptions.RequestException:
-            raise
+                if r.status_code == 405:
+                    print(f"HTTP 405 Method Not Allowed: {method} {url}")
+                r.raise_for_status()
+                return r
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 405:
+                    print(f"HTTP 405 Error Details: {method} {url} - {e.response.text}")
+                raise e
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                last_exception = e
+                wait_time = 2 ** attempt  # 指数退避: 1s, 2s, 4s
+                print(f"BitBrowser API连接失败(尝试 {attempt+1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    print(f"等待 {wait_time} 秒后重试...")
+                    time.sleep(wait_time)
+                continue
+            except requests.exceptions.RequestException:
+                raise
+        
+        # 所有重试都失败
+        raise last_exception if last_exception else RuntimeError(f"API请求失败: {url}")
 
     def update_browser(
         self, 
@@ -994,7 +1027,8 @@ def solve_slider(
     xpaths: Dict[str, str], 
     timeout_ms: int, 
     poll_ms: int, 
-    logger: Optional[Callable[[str], None]] = None
+    logger: Optional[Callable[[str], None]] = None,
+    stop_event: Optional[threading.Event] = None
 ) -> bool:
     """
     Attempt to solve a slider captcha.
@@ -1011,6 +1045,12 @@ def solve_slider(
     """
     t0 = time.time()
     ok_xpath = xpaths.get('code_url_element') or xpaths.get('next_btn') or xpaths.get('password_input')
+
+    extra_ok_locators = [
+        "//input[@autocomplete='one-time-code']",
+        "//input[contains(@placeholder, 'verification') or contains(@placeholder, 'code') or contains(@placeholder, '验证码')]",
+        "//input[@type='text' and string-length(@maxlength)='6']"
+    ]
 
     def _slider_container_visible(short_timeout_ms: int = 600) -> bool:
         try:
@@ -1045,16 +1085,29 @@ def solve_slider(
         return False
 
     def _ok_visible(short_timeout_ms: int) -> bool:
-        if not ok_xpath:
-            return False
-        try:
+        # Check primary xpath
+        if ok_xpath:
             try:
-                driver.switch_to.default_content()
+                try:
+                    driver.switch_to.default_content()
+                except Exception:
+                    pass
+                if element_visible(driver, ok_xpath, short_timeout_ms, poll_ms):
+                    return True
             except Exception:
                 pass
-            return element_visible(driver, ok_xpath, short_timeout_ms, poll_ms)
-        except Exception:
-            return False
+        
+        # Check extra locators (only if we are looking for code input)
+        # We assume if 'code_url_element' is in xpaths, we are at that stage
+        if xpaths.get('code_url_element'):
+            for loc in extra_ok_locators:
+                try:
+                    if element_visible(driver, loc, 100, poll_ms):
+                        return True
+                except Exception:
+                    pass
+                    
+        return False
 
     try:
         if _ok_visible(min(1500, timeout_ms)):
@@ -1097,6 +1150,10 @@ def solve_slider(
     appear_wait_ms = min(max(timeout_ms, 15000), 60000)
     start = time.time()
     while (time.time() - start) * 1000 < appear_wait_ms:
+        if stop_event and stop_event.is_set():
+            if logger:
+                logger("Slider: 收到停止信号，终止等待")
+            raise RuntimeError(ERROR_STOPPED)
         try:
             if _ok_visible(800):
                 if logger:
@@ -1122,6 +1179,14 @@ def solve_slider(
             driver.switch_to.frame(iframe)
         for i in range(10):
             # 每次尝试重新定位容器与句柄，避免刷新后引用失效
+            if stop_event and stop_event.is_set():
+                try:
+                    driver.switch_to.default_content()
+                except Exception:
+                    pass
+                if logger:
+                    logger("Slider: 收到停止信号，终止滑块处理")
+                raise RuntimeError(ERROR_STOPPED)
             try:
                 # 确保位于正确的文档或iframe中
                 try:
@@ -1210,6 +1275,10 @@ def solve_slider(
                     pass
 
                 if not _slider_container_visible(600):
+                    if stop_event and stop_event.is_set():
+                        if logger:
+                            logger("Slider: 收到停止信号，终止等待")
+                        raise RuntimeError(ERROR_STOPPED)
                     if _ok_visible(1200):
                         if cache_key:
                             _SLIDER_PASS_CACHE[cache_key] = {'ok': True, 't': time.time()}
@@ -1627,33 +1696,85 @@ def get_verification_code(
 # BROWSER UTILITIES
 # =============================================================================
 
-def open_attached_driver(open_data: Dict[str, Any]) -> webdriver.Chrome:
-    """Open a Chrome driver attached to an existing browser instance."""
+def open_attached_driver(open_data: Dict[str, Any], max_retries: int = 3, logger: Optional[Callable[[str], None]] = None) -> webdriver.Chrome:
+    """Open a Chrome driver attached to an existing browser instance with retry mechanism."""
     driver_path = open_data.get('driver')
     debugger_address = open_data.get('http')
     if not driver_path or not debugger_address:
         raise RuntimeError(f"No driver/http returned: {open_data}")
-    options = webdriver.ChromeOptions()
-    options.debugger_address = debugger_address
-    try:
-        options.page_load_strategy = 'none'
-    except Exception:
-        pass
-    try:
-        options.set_capability('goog:loggingPrefs', {'browser': 'ALL', 'performance': 'ALL'})
-    except Exception:
-        pass
-    service = Service(executable_path=driver_path)
-    driver = webdriver.Chrome(service=service, options=options)
-    try:
-        driver.set_page_load_timeout(25)
-    except Exception:
-        pass
-    try:
-        driver.implicitly_wait(0)
-    except Exception:
-        pass
-    return driver
+    
+    # 验证 debugger_address 格式
+    if not debugger_address.startswith('http://') and not debugger_address.startswith('https://'):
+        debugger_address = f"http://{debugger_address}"
+    
+    last_exception = None
+    for attempt in range(max_retries):
+        try:
+            if logger and attempt > 0:
+                logger(f"WebDriver连接重试 {attempt+1}/{max_retries}...")
+            
+            options = webdriver.ChromeOptions()
+            options.debugger_address = debugger_address.replace('http://', '').replace('https://', '')
+            try:
+                options.page_load_strategy = 'none'
+            except Exception:
+                pass
+            try:
+                options.set_capability('goog:loggingPrefs', {'browser': 'ALL', 'performance': 'ALL'})
+            except Exception:
+                pass
+            
+            # 先检查调试端口是否可连接
+            import urllib.request
+            debug_check_url = f"{debugger_address}/json/version"
+            try:
+                with urllib.request.urlopen(debug_check_url, timeout=5) as response:
+                    if response.status != 200:
+                        raise RuntimeError(f"调试端口未就绪: {debugger_address}")
+            except Exception as e:
+                if logger:
+                    logger(f"调试端口检查失败: {e}")
+                # 不阻断，继续尝试连接
+            
+            service = Service(executable_path=driver_path)
+            driver = webdriver.Chrome(service=service, options=options)
+            
+            # 验证连接成功
+            try:
+                _ = driver.current_url  # 测试连接
+            except Exception as e:
+                driver.quit()
+                raise RuntimeError(f"WebDriver连接验证失败: {e}")
+            
+            # 设置超时 - 防止长时间阻塞
+            try:
+                driver.set_page_load_timeout(30)  # 页面加载超时30秒
+            except Exception:
+                pass
+            try:
+                driver.set_script_timeout(30)  # JS执行超时30秒
+            except Exception:
+                pass
+            try:
+                driver.implicitly_wait(0)  # 禁用隐式等待，使用显式等待
+            except Exception:
+                pass
+            
+            if logger:
+                logger(f"WebDriver连接成功: {debugger_address}")
+            return driver
+            
+        except Exception as e:
+            last_exception = e
+            wait_time = 2 ** attempt
+            if logger:
+                logger(f"WebDriver连接失败(尝试 {attempt+1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                if logger:
+                    logger(f"等待 {wait_time} 秒后重试...")
+                time.sleep(wait_time)
+    
+    raise last_exception if last_exception else RuntimeError("无法连接浏览器")
 
 
 def create_cdp_tab(debugger_address: str, url: str, logger: Optional[Callable[[str], None]] = None) -> bool:
@@ -2316,17 +2437,39 @@ def step_verify(
     if not (open_data.get('driver') and open_data.get('http')):
         raise RuntimeError(f"open_browser 未返回 driver/http: {open_data}")
     
+    # 等待浏览器调试端口就绪
+    debugger_addr = open_data.get('http', '')
+    if logger:
+        logger(f"等待浏览器调试端口就绪: {debugger_addr}")
+    
+    import urllib.request
+    port_ready = False
+    for port_check in range(10):  # 最多等待10次
+        try:
+            check_url = f"http://{debugger_addr}/json/version" if not debugger_addr.startswith('http') else f"{debugger_addr}/json/version"
+            with urllib.request.urlopen(check_url, timeout=2) as resp:
+                if resp.status == 200:
+                    port_ready = True
+                    if logger:
+                        logger(f"浏览器调试端口已就绪")
+                    break
+        except Exception:
+            pass
+        time.sleep(1)
+    
+    if not port_ready and logger:
+        logger("警告: 浏览器调试端口可能未就绪，继续尝试连接...")
+    
     # Wait for browser to fully start
     time.sleep(BROWSER_START_WAIT_SEC)
     
     driver = None
     try:
-        driver = open_attached_driver(open_data)
+        driver = open_attached_driver(open_data, max_retries=3, logger=logger)
     except Exception as attach_err:
         if logger:
-            logger(f"连接浏览器失败，尝试重试: {attach_err}")
-        time.sleep(3)
-        driver = open_attached_driver(open_data)
+            logger(f"连接浏览器最终失败: {attach_err}")
+        raise RuntimeError(f"无法连接到比特浏览器: {attach_err}")
         
     ctx['driver'] = driver
     ctx['t_attached'] = time.time()
@@ -2585,7 +2728,7 @@ def step_write(
         if attempt > 0 and logger:
             logger(f"Slider: 重试 {attempt+1}/{MAX_SLIDER_RETRIES}")
         
-        if solve_slider(driver, xpaths, timeout_ms, poll_ms, logger=logger):
+        if solve_slider(driver, xpaths, timeout_ms, poll_ms, logger=logger, stop_event=stop_event):
             slider_ok = True
             break
             
@@ -2694,6 +2837,14 @@ def step_confirm(
 
     if logger:
         logger("使用 Unified Captcha 模式获取验证码...")
+    
+    # User Request: 3 Retries for Code Extraction (Handled inside extract_verification_code_unified)
+    # The extract_verification_code_unified function already implements a retry loop (max_retries=3)
+    # with Resend Code clicking. We should not loop here to avoid 3x3=9 attempts.
+    
+    if stop_event and stop_event.is_set():
+        raise RuntimeError(ERROR_STOPPED)
+        
     code = extract_verification_code_unified(
         driver, 
         str(row.get('email') or row.get('账号') or ''), 
@@ -2706,8 +2857,21 @@ def step_confirm(
         extraction_mode=extraction_mode, 
         extraction_url=extraction_url
     )
-    
+
     if not code:
+        # User Request: Mark as problem email and release resources
+        if email_pool:
+            try:
+                email = str(row.get('email') or row.get('账号') or '')
+                # Mark as 'problem' with reason
+                email_pool.update_email_status(email, 'problem', reason='验证码获取超时 (3次重试)')
+                ctx['failure_status_set'] = True
+                if logger:
+                    logger(f"已标记为问题邮箱 (fail_code_timeout): {email}")
+            except Exception as e:
+                if logger:
+                    logger(f"标记问题邮箱失败: {e}")
+
         if logger:
             logger("步骤: 获取验证码失败(超时)")
         # Diagnosis
@@ -2961,13 +3125,16 @@ def perform_registration(
             t_attached = ctx.get('t_attached')
             
             # Rollback
-            if not result_ok and email_pool:
-                try:
-                    email_pool.update_email_status(email, 'failed')
-                    if logger:
-                        logger(f"邮箱 {email} 已标记为 failed (注册未完成)")
-                except Exception:
-                    pass
+            # If events.on_failure is provided, let it handle the status update
+            if not result_ok and email_pool and not (events and events.on_failure):
+                # Check if specific failure status was already set (e.g. fail_code_timeout)
+                if not ctx.get('failure_status_set'):
+                    try:
+                        email_pool.update_email_status(email, 'failed')
+                        if logger:
+                            logger(f"邮箱 {email} 已标记为 failed (注册未完成)")
+                    except Exception:
+                        pass
 
             if logger:
                 logger(f"正在清理资源: {browser_id}")
@@ -3097,35 +3264,75 @@ def run_batch(
     with open(xpaths_path, 'r', encoding='utf-8') as f:
         xpaths = json.load(f)
     client = BitBrowserClient(base_url, secret)
-    def _ping(url: str) -> bool:
+    
+    def _ping(url: str, timeout: int = 10) -> tuple[bool, str]:
+        """增强版ping检查，返回状态和详细信息"""
         try:
             # 优化: 使用 list 接口代替 update/create 来进行健康检查，避免产生残留窗口
             payload = {'page': 0, 'pageSize': 1}
             h = client._headers()
-            r = requests.post(f"{url.rstrip('/')}/browser/list", headers=h, data=json.dumps(payload), timeout=5)
+            r = requests.post(f"{url.rstrip('/')}/browser/list", headers=h, data=json.dumps(payload), timeout=timeout)
             if r.status_code == 200:
                 try:
-                    r.json()
-                    return True
-                except (json.JSONDecodeError, ValueError):
-                    pass
-            return False
-        except requests.exceptions.RequestException:
-            return False
+                    data = r.json()
+                    if data.get('success') or 'data' in data:
+                        return True, f"API正常响应"
+                    return True, "API响应(可能无数据)"
+                except (json.JSONDecodeError, ValueError) as e:
+                    return False, f"JSON解析失败: {e}"
+            elif r.status_code == 401:
+                return False, f"认证失败(401)，请检查secret配置"
+            elif r.status_code == 404:
+                return False, f"API接口不存在(404)"
+            else:
+                return False, f"HTTP错误: {r.status_code}"
+        except requests.exceptions.ConnectTimeout:
+            return False, "连接超时"
+        except requests.exceptions.ConnectionError as e:
+            return False, f"连接被拒绝: {e}"
+        except requests.exceptions.RequestException as e:
+            return False, f"请求异常: {e}"
+    
     if logger:
         logger("开始进行比特浏览器接口连通性检查 (health-check)")
-    if not _ping(client.base_url):
+    
+    # 尝试主URL
+    ping_ok, ping_msg = _ping(client.base_url, timeout=10)
+    if not ping_ok:
+        if logger:
+            logger(f"主接口 {client.base_url} 检查失败: {ping_msg}")
+        
+        # 尝试其他端口
         candidates = [client.base_url] + [f"http://127.0.0.1:{p}" for p in (54345, 54346, 54321, 54322, 50325, 55555)]
+        found = False
         for c in candidates:
-            if _ping(c):
+            if c == client.base_url:
+                continue
+            ping_ok, ping_msg = _ping(c, timeout=5)
+            if ping_ok:
                 client.base_url = c.rstrip('/')
                 if logger:
                     logger(f"已自动切换比特浏览器接口到: {client.base_url}")
+                found = True
                 break
-        else:
+            else:
+                if logger:
+                    logger(f"尝试接口 {c}: {ping_msg}")
+        
+        if not found:
             if logger:
-                logger("比特浏览器接口不可用，请确认应用已启动并开启本地API")
+                logger("=" * 50)
+                logger("❌ 比特浏览器接口不可用")
+                logger("请检查以下几点：")
+                logger("1. 比特浏览器客户端是否已启动")
+                logger("2. 是否已开启'启用本地API接口'选项")
+                logger("3. 防火墙是否拦截了 54345 端口")
+                logger("4. 配置中的API地址是否正确")
+                logger("=" * 50)
             return
+    else:
+        if logger:
+            logger(f"✅ 比特浏览器接口连接正常: {client.base_url}")
     
     lock = threading.Lock()
     global_success_count = 0
@@ -3263,10 +3470,27 @@ def run_batch(
                         events.on_failure(email, msg)
                     if logger:
                         logger(f"重试 {attempts}/{MAX_REGISTRATION_ATTEMPTS}: {email} 失败原因: {msg}")
-                    if msg and ('proxy' in msg or 'network' in msg):
+
+                    # Check if marked as 'problem' to abort retry immediately
+                    if email_pool:
+                        try:
+                            cfg = email_pool.get_email_config(email)
+                            if cfg and cfg.get('status') == 'problem':
+                                if logger:
+                                    logger(f"检测到邮箱 {email} 已标记为问题邮箱，停止重试")
+                                break
+                        except Exception:
+                            pass
+
+                    # 自动重试条件：proxy/network 错误 或 超时错误
+                    if msg and ('proxy' in msg or 'network' in msg or 'timed out' in msg.lower()):
+                        if 'timed out' in msg.lower():
+                            if logger:
+                                logger(f"检测到超时，自动释放资源并准备重试...")
                         time.sleep(3)
                         continue
                     else:
+                        # 非重试类错误，结束重试
                         break
             
             if ip_manager and not ok:
@@ -3305,8 +3529,23 @@ def run_batch(
                         elif msg == 'email_used_prompt':
                             email_pool.update_email_status(email, 'fail_used')
                         else:
-                            # User requested to reset to unused on failure
-                            email_pool.update_email_status(email, 'new')
+                            # Check if email is already marked as 'problem' (e.g., by on_failure callback)
+                            # If so, don't reset it to 'new'
+                            current_status = None
+                            if email_pool:
+                                try:
+                                    cfg = email_pool.get_email_config(email)
+                                    if cfg:
+                                        current_status = cfg.get('status')
+                                except Exception:
+                                    pass
+                            
+                            if current_status == 'problem':
+                                if logger:
+                                    logger(f"邮箱 {email} 保持问题邮箱状态，不重置为未使用")
+                            else:
+                                # User requested to reset to unused on failure
+                                email_pool.update_email_status(email, 'new')
         finally:
             # Check if we need to release IP mapping if task failed
             if ip_manager and 'ip_entry' in locals() and ip_entry:

@@ -100,6 +100,7 @@ class IPManager:
             DataField.IPS: [],
             "used_emails": []
         }
+        self.last_import_duplicates: Set[Tuple[str, str]] = set()
         self._load_config()
         self.verify_consistency()
 
@@ -455,6 +456,7 @@ class IPManager:
             成功导入的IP数量
         """
         with self.lock:
+            self.last_import_duplicates = set()
             count = 0
             lines = content.splitlines()
             for line in lines:
@@ -469,6 +471,7 @@ class IPManager:
                 
                 # 跳过重复项
                 if self._is_duplicate_ip(host, port):
+                    self.last_import_duplicates.add((host, str(port)))
                     continue
 
                 ip_entry: Dict[str, Any] = {
@@ -492,6 +495,10 @@ class IPManager:
                 self._log(f"Imported {count} new IPs. Reset allocation index to {first_new_index}.")
                 self._save_config()
             return count
+
+    def get_last_import_duplicates(self) -> Set[Tuple[str, str]]:
+        with self.lock:
+            return set(self.last_import_duplicates)
 
     def get_used_emails(self) -> Set[str]:
         """
@@ -526,6 +533,33 @@ class IPManager:
                 ]
             except re.error:
                 return 0
+            
+            removed = initial_count - len(self.data[DataField.IPS])
+            if removed > 0:
+                self._save_config()
+            return removed
+
+    def batch_delete_ips(self, hosts: List[str]) -> int:
+        """
+        批量删除指定Host的IP。
+        
+        Args:
+            hosts: 要删除的IP地址列表
+            
+        Returns:
+            成功删除的数量
+        """
+        if not hosts:
+            return 0
+            
+        hosts_set = set(hosts)
+        with self.lock:
+            initial_count = len(self.data[DataField.IPS])
+            
+            self.data[DataField.IPS] = [
+                ip for ip in self.data[DataField.IPS]
+                if ip.get(IPField.HOST) not in hosts_set
+            ]
             
             removed = initial_count - len(self.data[DataField.IPS])
             if removed > 0:

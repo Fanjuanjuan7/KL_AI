@@ -44,9 +44,10 @@ class EmailStatus:
     INVALID = "invalid"   # 无效
     BANNED = "banned"     # 已封禁
     USED = "used"         # 已使用
+    PROBLEM = "problem"   # 问题邮箱（验证码获取失败等）
 
 # 无效状态集合（邮箱不可用于注册）
-INVALID_STATUSES: Final[set] = {EmailStatus.DISABLED, EmailStatus.INVALID, EmailStatus.BANNED}
+INVALID_STATUSES: Final[set] = {EmailStatus.DISABLED, EmailStatus.INVALID, EmailStatus.BANNED, EmailStatus.PROBLEM}
 
 # 已完成状态集合（邮箱已成功完成注册流程）
 COMPLETED_STATUSES: Final[set] = {EmailStatus.SUCCESS, EmailStatus.REGISTERED, EmailStatus.SUBMITTED}
@@ -145,6 +146,10 @@ class EmailPool:
                 password = parts[1].strip() if len(parts) > 1 else ""
                 auth_code = parts[2].strip() if len(parts) > 2 else password
                 raw_status = parts[3].strip() if len(parts) > 3 else EmailStatus.NEW
+                
+                # Load failure reason and time if available
+                failure_reason = parts[4].strip() if len(parts) > 4 else ""
+                failure_time = parts[5].strip() if len(parts) > 5 else ""
 
                 # 规范化状态
                 status = self._normalize_status(raw_status)
@@ -153,7 +158,9 @@ class EmailPool:
                     'email': email,
                     'password': password,
                     'auth_code': auth_code, 
-                    'status': status
+                    'status': status,
+                    'failure_reason': failure_reason,
+                    'failure_time': failure_time
                 })
 
     def _normalize_status(self, status: str) -> str:
@@ -190,7 +197,13 @@ class EmailPool:
                         password = item['password']
                         auth_code = item['auth_code']
                         status = item.get('status', EmailStatus.NEW)
-                        tf.write(f"{email}{FIELD_SEPARATOR}{password}{FIELD_SEPARATOR}{auth_code}{FIELD_SEPARATOR}{status}\n")
+                        failure_reason = item.get('failure_reason', '')
+                        failure_time = item.get('failure_time', '')
+                        
+                        line = f"{email}{FIELD_SEPARATOR}{password}{FIELD_SEPARATOR}{auth_code}{FIELD_SEPARATOR}{status}"
+                        if failure_reason or failure_time:
+                            line += f"{FIELD_SEPARATOR}{failure_reason}{FIELD_SEPARATOR}{failure_time}"
+                        tf.write(line + "\n")
                 
                 # 重命名临时文件到实际文件
                 shutil.move(temp_path, self.pool_file)
@@ -229,20 +242,29 @@ class EmailPool:
                     return True
         return False  # 邮箱不存在也视为无效
 
-    def update_email_status(self, email: str, status: str) -> None:
+    def update_email_status(self, email: str, status: str, reason: str = "") -> None:
         """
         更新邮箱状态并保存。
         
         Args:
             email: 要更新的邮箱地址
             status: 新状态
+            reason: 失败原因 (可选)
         """
         dirty = False
+        import time
         with self._lock:
             for item in self.emails:
                 if item['email'] == email:
-                    if item.get('status') != status:
+                    if item.get('status') != status or (reason and item.get('failure_reason') != reason):
                         item['status'] = status
+                        if reason:
+                            item['failure_reason'] = reason
+                            item['failure_time'] = time.strftime('%Y-%m-%d %H:%M:%S')
+                        elif status == EmailStatus.NEW:
+                             # Reset failure info if setting to NEW
+                             item['failure_reason'] = ""
+                             item['failure_time'] = ""
                         dirty = True
                     break
             if dirty:
@@ -258,7 +280,7 @@ class EmailPool:
         
         可用性判断：
         - success/registered/submitted: 已完成，不可用
-        - disabled/invalid/banned: 已禁用，不可用
+        - disabled/invalid/banned/problem: 已禁用/问题邮箱，不可用
         - processing: 正在处理中，不可用
         - new/failed/stopped: 可用
         
@@ -307,7 +329,7 @@ class EmailPool:
                 - None: 统计所有邮箱
                 
         Returns:
-            包含 total_emails 和 used_emails 的字典
+            包含 total_emails, used_emails, problem_emails 的字典
         """
         with self._lock:
             # 根据模式过滤邮箱
@@ -324,10 +346,13 @@ class EmailPool:
             # 已使用 = success/registered/submitted/used
             completed_statuses = COMPLETED_STATUSES | {EmailStatus.USED}
             used = sum(1 for e in target_emails if e.get('status', EmailStatus.NEW) in completed_statuses)
+            # 问题邮箱
+            problem = sum(1 for e in target_emails if e.get('status', EmailStatus.NEW) == EmailStatus.PROBLEM)
             
         return {
             'total_emails': total,
-            'used_emails': used
+            'used_emails': used,
+            'problem_emails': problem
         }
 
     def delete_email(self, email: str) -> bool:
@@ -352,23 +377,77 @@ class EmailPool:
             self._notify_listeners()
         return deleted
 
-    def update_status(self, email: str, status: str) -> bool:
+    def batch_delete_emails(self, emails: List[str]) -> Dict[str, any]:
+        """
+        批量删除邮箱。
+        
+        Args:
+            emails: 要删除的邮箱地址列表
+            
+        Returns:
+            包含删除结果的字典:
+            {
+                'success': bool,  # 是否全部成功
+                'deleted_count': int,  # 成功删除的数量
+                'failed': List[tuple],  # 失败的邮箱和原因 [(email, reason), ...]
+            }
+        """
+        result = {
+            'success': True,
+            'deleted_count': 0,
+            'failed': []
+        }
+        
+        deleted_any = False
+        
+        with self._lock:
+            for email in emails:
+                try:
+                    initial_len = len(self.emails)
+                    self.emails = [e for e in self.emails if e['email'] != email]
+                    if len(self.emails) < initial_len:
+                        result['deleted_count'] += 1
+                        deleted_any = True
+                    else:
+                        result['failed'].append((email, "邮箱不存在"))
+                        result['success'] = False
+                except Exception as e:
+                    result['failed'].append((email, str(e)))
+                    result['success'] = False
+            
+            if deleted_any:
+                self._save_pool()
+        
+        if deleted_any:
+            self._notify_listeners()
+        
+        return result
+
+    def update_status(self, email: str, status: str, reason: str = "") -> bool:
         """
         更新邮箱状态（update_email_status 的别名）。
         
         Args:
             email: 要更新的邮箱地址
             status: 新状态
+            reason: 失败原因 (可选)
             
         Returns:
             如果状态发生变化返回 True
         """
         updated = False
+        import time
         with self._lock:
             for e in self.emails:
                 if e['email'] == email:
-                    if e.get('status') != status:
+                    if e.get('status') != status or (reason and e.get('failure_reason') != reason):
                         e['status'] = status
+                        if reason:
+                            e['failure_reason'] = reason
+                            e['failure_time'] = time.strftime('%Y-%m-%d %H:%M:%S')
+                        elif status == EmailStatus.NEW:
+                             e['failure_reason'] = ""
+                             e['failure_time'] = ""
                         updated = True
                     break
             if updated:
