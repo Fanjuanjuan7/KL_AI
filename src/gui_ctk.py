@@ -893,12 +893,14 @@ class App(*BaseClasses):
         text_area.focus_set()
 
         # Access underlying Tkinter Text widget for advanced features
-        tk_text = text_area._textbox
+        tk_text = getattr(text_area, "_textbox", None)
+        if tk_text is None:
+            tk_text = getattr(text_area, "_text", None)
         
-        # Configure tag for invalid lines
-        tk_text.tag_config("invalid_line", background="#FFEBEB", foreground="#D00000")
-        if ctk.get_appearance_mode() == "Dark":
-            tk_text.tag_config("invalid_line", background="#550000", foreground="#FF5555")
+        if tk_text is not None:
+            tk_text.tag_config("invalid_line", background="#FFEBEB", foreground="#D00000")
+            if ctk.get_appearance_mode() == "Dark":
+                tk_text.tag_config("invalid_line", background="#550000", foreground="#FF5555")
 
         def validate_line(line_content):
             line_content = line_content.strip()
@@ -918,18 +920,20 @@ class App(*BaseClasses):
                 return False
 
         def check_content(event=None):
-            tk_text.tag_remove("invalid_line", "1.0", "end")
-            
-            full_text = tk_text.get("1.0", "end-1c")
+            if tk_text is not None:
+                tk_text.tag_remove("invalid_line", "1.0", "end")
+                full_text = tk_text.get("1.0", "end-1c")
+            else:
+                full_text = text_area.get("1.0", "end-1c")
             lines = full_text.split('\n')
             
             has_error = False
             for i, line in enumerate(lines):
                 if not validate_line(line):
-                    # Apply tag to this line
-                    start = f"{i+1}.0"
-                    end = f"{i+1}.0 lineend"
-                    tk_text.tag_add("invalid_line", start, end)
+                    if tk_text is not None:
+                        start = f"{i+1}.0"
+                        end = f"{i+1}.0 lineend"
+                        tk_text.tag_add("invalid_line", start, end)
                     has_error = True
             
             return has_error
@@ -938,7 +942,10 @@ class App(*BaseClasses):
             check_content()
             
         def on_delimiter_key(event):
-            tk_text.insert("insert", "\n")
+            if tk_text is not None:
+                tk_text.insert("insert", "\n")
+            else:
+                text_area.insert("insert", "\n")
             check_content()
             return "break"
             
@@ -951,21 +958,25 @@ class App(*BaseClasses):
                 formatted_lines = [line.strip() for line in formatted.splitlines() if line.strip()]
                 formatted_text = "\n".join(formatted_lines)
                 
-                tk_text.insert("insert", formatted_text)
+                if tk_text is not None:
+                    tk_text.insert("insert", formatted_text)
+                else:
+                    text_area.insert("insert", formatted_text)
                 check_content()
                 return "break"
             except Exception:
                 pass
 
         # Bindings
-        tk_text.bind("<KeyRelease>", on_key_release)
-        tk_text.bind("<space>", on_delimiter_key)
-        tk_text.bind("<comma>", on_delimiter_key)
-        tk_text.bind("，", on_delimiter_key)
-        tk_text.bind(";", on_delimiter_key)
-        tk_text.bind("；", on_delimiter_key)
-        tk_text.bind("<Return>", lambda e: check_content())
-        tk_text.bind("<<Paste>>", on_paste)
+        if tk_text is not None:
+            tk_text.bind("<KeyRelease>", on_key_release)
+            tk_text.bind("<space>", on_delimiter_key)
+            tk_text.bind("<comma>", on_delimiter_key)
+            tk_text.bind("，", on_delimiter_key)
+            tk_text.bind(";", on_delimiter_key)
+            tk_text.bind("；", on_delimiter_key)
+            tk_text.bind("<Return>", lambda e: check_content())
+            tk_text.bind("<<Paste>>", on_paste)
         
         def do_import():
             if check_content():
@@ -1001,6 +1012,15 @@ class App(*BaseClasses):
                     
         ctk.CTkButton(btn_frame, text="确定导入", command=do_import, 
                     width=120, height=36, font=("Arial", 14, "bold")).pack(side='right', padx=5)
+
+        try:
+            top.update_idletasks()
+            if sys.platform.startswith("win"):
+                top.minsize(760, 620)
+                top.geometry("760x620")
+                top.resizable(True, True)
+        except Exception:
+            pass
 
                 
     def modify_ip_usage_dialog(self):

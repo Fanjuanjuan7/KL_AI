@@ -22,6 +22,7 @@ import shutil
 import threading
 import re
 import time
+import ipaddress
 from typing import List, Dict, Optional, Tuple, Any, Set, Callable, Final
 
 
@@ -408,8 +409,101 @@ class IPManager:
         # 将常见分隔符统一为逗号
         cleaned = line.replace(':', ',').replace('|', ',').replace('\t', ',')
         parts = [p.strip() for p in cleaned.split(',') if p.strip()]
-        
-        return parts if parts else None
+
+        if not parts:
+            return None
+
+        def _clean_token(tok: str) -> str:
+            return tok.strip().strip('"').strip("'").strip()
+
+        def _is_ipv4(tok: str) -> bool:
+            try:
+                ip = ipaddress.ip_address(tok)
+                return ip.version == 4
+            except Exception:
+                return False
+
+        def _is_hostname(tok: str) -> bool:
+            if not tok or len(tok) > 255:
+                return False
+            return bool(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*", tok))
+
+        host_index: Optional[int] = None
+        for i, raw in enumerate(parts):
+            tok = _clean_token(raw)
+            if _is_ipv4(tok) or _is_hostname(tok):
+                host_index = i
+                parts[i] = tok
+                break
+
+        if host_index is None:
+            return None
+
+        for j in range(host_index + 1, len(parts)):
+            parts[j] = _clean_token(parts[j])
+
+        return parts[host_index:]
+
+    def _maybe_extract_ip_column_lines(self, content: str) -> Optional[List[str]]:
+        sample = content[:20000]
+        if not any(d in sample for d in [",", ";", "\t"]):
+            return None
+
+        try:
+            import csv
+            import io
+
+            dialect = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t"])
+            reader = csv.reader(io.StringIO(content), dialect)
+            rows = list(reader)
+        except Exception:
+            return None
+
+        if not rows:
+            return None
+
+        max_cols = 0
+        for r in rows:
+            if len(r) > max_cols:
+                max_cols = len(r)
+
+        if max_cols <= 1:
+            return None
+
+        def _extract_first_ipv4(text: str) -> Optional[str]:
+            if not text:
+                return None
+            for m in re.finditer(r"(?:\d{1,3}\.){3}\d{1,3}", text):
+                cand = m.group(0)
+                try:
+                    ip = ipaddress.ip_address(cand)
+                    if ip.version == 4:
+                        return cand
+                except Exception:
+                    continue
+            return None
+
+        scores = [0] * max_cols
+        for r in rows:
+            for i in range(max_cols):
+                cell = r[i] if i < len(r) else ""
+                if _extract_first_ipv4(cell):
+                    scores[i] += 1
+
+        best_i = max(range(max_cols), key=lambda i: scores[i])
+        if scores[best_i] <= 0:
+            return None
+
+        extracted: List[str] = []
+        for r in rows:
+            cell = r[best_i] if best_i < len(r) else ""
+            cell = (cell or "").strip()
+            if not cell:
+                continue
+            if _extract_first_ipv4(cell):
+                extracted.append(cell)
+
+        return extracted if extracted else None
 
     def _is_duplicate_ip(self, host: str, port: str) -> bool:
         """
@@ -458,7 +552,7 @@ class IPManager:
         with self.lock:
             self.last_import_duplicates = set()
             count = 0
-            lines = content.splitlines()
+            lines = self._maybe_extract_ip_column_lines(content) or content.splitlines()
             for line in lines:
                 parts = self._parse_ip_line(line, regex, replace_str)
                 if not parts:
@@ -466,6 +560,10 @@ class IPManager:
                 
                 host = parts[0]
                 port = parts[1] if len(parts) > 1 else default_port
+                if port and not str(port).isdigit():
+                    port = default_port
+                if not port:
+                    port = default_port
                 user = parts[2] if len(parts) > 2 else default_user
                 pwd  = parts[3] if len(parts) > 3 else default_pass
                 
