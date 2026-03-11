@@ -2013,7 +2013,8 @@ def extract_verification_code_unified(
     proxy_config: Optional[Dict[str, Any]] = None, 
     stop_event: Optional[threading.Event] = None, 
     extraction_mode: str = 'imap', 
-    extraction_url: Optional[str] = None
+    extraction_url: Optional[str] = None,
+    email_pool: Optional[Any] = None
 ) -> Optional[str]:
     """
     Unified verification code extraction using src.captcha_receiver and UI interaction (Resend Code).
@@ -2068,6 +2069,15 @@ def extract_verification_code_unified(
         except Exception as e:
             if logger:
                 logger(f"Unified Captcha: ❌ 初始化邮箱连接失败: {e}")
+            if email_pool:
+                try:
+                    reason = f"IMAP登录失败: {str(e)}"
+                    email_pool.update_status(email_addr, 'problem', reason=reason)
+                    if logger:
+                        logger(f"邮箱 {email_addr} 已被自动标记为问题邮箱。")
+                except Exception as pool_e:
+                    if logger:
+                        logger(f"标记问题邮箱失败: {pool_e}")
             return None
 
     try:
@@ -2855,7 +2865,8 @@ def step_confirm(
         proxy_config=proxy_config, 
         stop_event=stop_event,
         extraction_mode=extraction_mode, 
-        extraction_url=extraction_url
+        extraction_url=extraction_url,
+        email_pool=email_pool
     )
 
     if not code:
