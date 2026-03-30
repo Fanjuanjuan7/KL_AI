@@ -40,7 +40,7 @@ except ImportError:
 # =============================================================================
 
 # Time constants (in seconds)
-DEFAULT_TIMEOUT_SEC = 90  # 降低超时到90秒，避免长时间阻塞
+DEFAULT_TIMEOUT_SEC = 200  # 降低超时到90秒，避免长时间阻塞
 DEFAULT_POLL_INTERVAL_SEC = 0.5
 PAGE_READY_TIMEOUT_SEC = 12
 CONNECTIVITY_MAX_WAIT_SEC = 30  # 增加网络检测等待时间
@@ -59,7 +59,7 @@ SHORT_TIMEOUT_MS = 8000
 # Retry constants
 MAX_SLIDER_RETRIES = 8
 MAX_REGISTRATION_ATTEMPTS = 3
-MAX_CODE_RETRIES = 3
+MAX_CODE_RETRIES = 2
 MAX_BROWSER_DELETE_RETRIES = 3
 SAFE_CLICK_RETRIES = 2
 
@@ -2530,7 +2530,7 @@ def extract_verification_code_unified(
 
                         if logger:
                             logger("Unified Captcha: 等待邮件发送 (5s)...")
-                        time.sleep(5)  # Wait for email delivery
+                        time.sleep(8)  # Wait for email delivery
                     else:
                         if logger:
                             logger(
@@ -2951,7 +2951,7 @@ def step_write(
         logger("步骤: 已切换到新标签")
     wait_page_ready(driver, 20)
 
-    time.sleep(0.5)
+    time.sleep(1)
     if logger:
         logger("步骤: 点击 Sign In")
     if not safe_click_any(
@@ -3188,7 +3188,7 @@ def step_write(
 
     if logger:
         logger("步骤: 滑块通过，强制等待 5 秒...")
-    time.sleep(1)
+    time.sleep(8)
     if logger:
         logger("步骤: 滑块通过，立即跳转接码页等待验证码")
 
@@ -3401,8 +3401,8 @@ def step_confirm(
     find_click_any(driver, xpaths["final_submit_btn"], timeout_ms, poll_ms)
 
     if logger:
-        logger("提交后强制等待 1 秒...")
-    time.sleep(3)
+        logger("提交后强制等待 6 秒...")
+    time.sleep(6)
 
     # 注册跳转流程重定义 (User Request 2)
     if logger:
