@@ -916,15 +916,27 @@ def safe_click(
 def first_present_xpath(
     driver: webdriver.Remote, xpaths: List[Optional[str]], timeout_ms: int, poll_ms: int
 ) -> Optional[str]:
-    """Find the first visible XPath from a list."""
-    for xp in xpaths:
-        if not xp:
-            continue
-        try:
-            if element_exists_visible(driver, xp, min(timeout_ms, 12000), poll_ms):
-                return xp
-        except Exception:
-            pass
+    """并行高频探测：找出列表中第一个出现的可见 XPath，不再串行死等。"""
+    valid_xpaths = [xp for xp in xpaths if xp]
+    if not valid_xpaths:
+        return None
+
+    eff_timeout = min(timeout_ms, 12000) / 1000.0  # 最大等待12秒
+    eff_poll = max(0.2, poll_ms / 1000.0)
+    end_time = time.time() + eff_timeout
+
+    while time.time() < end_time:
+        for xp in valid_xpaths:
+            try:
+                # 瞬间探测，如果不存在立刻抛异常进入下一个，绝对不阻塞
+                elements = driver.find_elements(By.XPATH, xp)
+                for el in elements:
+                    if el.is_displayed():
+                        return xp
+            except Exception:
+                continue
+        time.sleep(eff_poll)
+    
     return None
 
 
@@ -1002,27 +1014,11 @@ def safe_send_keys_any(
     logger: Optional[Callable[[str], None]] = None,
     retries: int = 1,
 ) -> bool:
-    """Send keys to the first available input element from a list of XPaths."""
-    for xp in xpaths:
-        if not xp:
-            continue
-        if safe_send_keys(driver, xp, text, timeout_ms, poll_ms, logger, retries):
-            return True
-        try:
-            el = WebDriverWait(
-                driver,
-                min(timeout_ms, 12000) / 1000.0,
-                poll_frequency=max(0.2, poll_ms / 1000.0),
-            ).until(EC.presence_of_element_located((By.XPATH, xp)))
-            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-            try:
-                el.send_keys(text)
-                return True
-            except Exception:
-                pass
-        except Exception:
-            pass
-    return False
+    """智能并行输入：先用 first_present_xpath 极速定位，再安全输入。"""
+    xp = first_present_xpath(driver, xpaths, timeout_ms, poll_ms)
+    if not xp:
+        return False
+    return safe_send_keys(driver, xp, text, timeout_ms, poll_ms, logger, retries)
 
 
 def validate_xpaths(
@@ -1468,394 +1464,6 @@ def solve_slider(
 
 
 # =============================================================================
-# CODE EXTRACTION UTILITIES
-# =============================================================================
-
-
-def extract_code_from_page_text(driver: webdriver.Remote) -> Optional[str]:
-    """Extract 6-digit verification code from page body text."""
-    try:
-        body_text = driver.find_element(By.TAG_NAME, "body").text
-        m = re.search(r"\b(\d{6})\b", body_text)
-        if m:
-            return m.group(1)
-    except Exception:
-        pass
-    return None
-
-
-def extract_code_using_xpath(driver: webdriver.Remote, xpath: str) -> Optional[str]:
-    """Extract 6-digit verification code from element at given XPath."""
-    try:
-        el = driver.find_element(By.XPATH, xpath)
-        txt = el.text or el.get_attribute("value") or ""
-        m = re.search(r"\b(\d{6})\b", txt)
-        if m:
-            return m.group(1)
-    except Exception:
-        pass
-    return None
-
-
-def extract_code_from_url(
-    url: str, logger: Optional[Callable[[str], None]] = None
-) -> Optional[str]:
-    """
-    Extract verification code from a given URL (XinLan Mode).
-
-    Args:
-        url: URL to fetch and extract code from
-        logger: Optional logging function
-
-    Returns:
-        6-digit verification code if found, None otherwise
-    """
-    try:
-        # Use a real user-agent to avoid basic blocking
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        }
-        resp = requests.get(url, headers=headers, timeout=10)
-        if resp.status_code == 200:
-            content = resp.text
-            # Use strict 6-digit regex as per user requirement: "连续6位数字"
-            # And also per user request: "使用正则表达式提取网页中的连续6位数字验证码"
-            codes = re.findall(r"\b\d{6}\b", content)
-            if codes:
-                # Return the last one found as it's likely the newest one if multiple exist
-                # Or first? Usually pages show latest at top or it's a dedicated page.
-                # Let's return the first one for now.
-                return codes[0]
-    except requests.exceptions.RequestException as e:
-        if logger:
-            logger(f"HTTP Code Extraction Failed: {e}")
-    return None
-
-
-def wait_extract_code(
-    driver: webdriver.Remote,
-    xpath: Optional[str],
-    max_wait_sec: int = 20,
-    logger: Optional[Callable[[str], None]] = None,
-    extraction_mode: str = "imap",
-    extraction_url: Optional[str] = None,
-) -> Optional[str]:
-    """Wait and extract verification code with multiple strategies."""
-    end = time.time() + max_wait_sec
-    code: Optional[str] = None
-    while time.time() < end:
-        if logger:
-            logger("等待验证码...")
-
-        # XinLan Mode Support
-        if extraction_mode == "http" and extraction_url:
-            code = extract_code_from_url(extraction_url, logger)
-            if code:
-                if logger:
-                    logger(f"验证码通过HTTP提取: {code}")
-                return code
-            # If not found, fall through to sleep and retry
-        else:
-            # Original Logic
-            if xpath:
-                try:
-                    WebDriverWait(driver, 3).until(
-                        EC.presence_of_element_located((By.XPATH, xpath))
-                    )
-                    code = extract_code_using_xpath(driver, xpath)
-                    if code:
-                        if logger:
-                            logger(f"验证码通过XPath提取: {code}")
-                        return code
-                except Exception:
-                    pass
-            code = extract_code_from_page_text(driver)
-            if code:
-                if logger:
-                    logger(f"验证码通过文本提取: {code}")
-                return code
-
-        time.sleep(1)
-    return None
-
-
-def extract_code_attempts(
-    driver: webdriver.Remote,
-    xpath: Optional[str],
-    logger: Optional[Callable[[str], None]],
-    attempts: int = MAX_CODE_RETRIES,
-) -> Optional[str]:
-    """Extract verification code with multiple attempts."""
-    code: Optional[str] = None
-    for i in range(max(1, attempts)):
-        if logger:
-            logger(f"尝试提取验证码 {i + 1}/{attempts}")
-        try:
-            if xpath:
-                try:
-                    el = WebDriverWait(driver, 10).until(
-                        EC.presence_of_element_located((By.XPATH, xpath))
-                    )
-                    txt = (el.text or el.get_attribute("value") or "").strip()
-                    if logger:
-                        logger(f"元素文本: '{txt}'")
-                    m = re.search(r"\b(\d{6})\b", txt)
-                    if m:
-                        code = m.group(1)
-                        return code
-                    clean = txt.replace(" ", "").replace("\n", "")
-                    if clean.isdigit() and len(clean) == 6:
-                        code = clean
-                        return code
-                except Exception as e:
-                    if logger:
-                        logger(f"元素提取失败: {e}")
-            page_txt = ""
-            try:
-                body = driver.find_element(By.TAG_NAME, "body")
-                page_txt = body.text
-            except Exception:
-                pass
-            if page_txt:
-                m2 = re.search(r"\b(\d{6})\b", page_txt)
-                if m2:
-                    code = m2.group(1)
-                    if logger:
-                        logger(f"页面文本提取验证码: {code}")
-                    return code
-        except Exception as e:
-            if logger:
-                logger(f"提取尝试异常: {e}")
-        time.sleep(1 if i < attempts - 1 else 0)
-    return code
-
-
-def extract_verification_code_flow(
-    driver: webdriver.Remote,
-    code_url: str,
-    code_xpath: Optional[str],
-    logger: Optional[Callable[[str], None]],
-    debugger_http: Optional[str] = None,
-    timeout: int = CODE_EXTRACTION_TIMEOUT_SEC,
-    resend_xpath: Optional[str] = None,
-) -> Optional[str]:
-    """
-    Robust verification code retrieval with retry mechanism.
-
-    Flow:
-      Loop (Max 4 times):
-        1. Wait 10s for code (poll 3s).
-        2. If not found -> Refresh -> Wait 10s.
-        3. If still not found -> Switch to Main Tab -> Click Resend -> Wait 2s -> Switch back.
-    """
-    main_handle = driver.current_window_handle
-    start_time = time.time()
-    max_retries = 4
-
-    # Configuration
-    INITIAL_WAIT = 10
-    REFRESH_WAIT = 10
-    RESEND_WAIT = 2
-
-    # Open Code Tab initially
-    code_tab_handle = None
-
-    try:
-        # Create new tab for code
-        driver.switch_to.new_window("tab")
-        code_tab_handle = driver.current_window_handle
-
-        # Navigate to code URL
-        if logger:
-            logger(f"打开接码页面: {code_url}")
-        try:
-            driver.get(code_url)
-        except Exception as e:
-            if logger:
-                logger(f"打开接码页面异常: {e}")
-            # Try JS open as fallback if needed, but get() is standard
-
-        for attempt in range(max_retries):
-            # Check execution time
-            if time.time() - start_time > timeout:
-                if logger:
-                    logger("验证码获取超时 (总时间限制)")
-                break
-
-            if logger:
-                logger(f"=== 接码尝试轮次 {attempt + 1}/{max_retries} ===")
-
-            # 1. First Detection (10s)
-            if logger:
-                logger(f"开始检测验证码 ({INITIAL_WAIT}s)...")
-            code = wait_extract_code(
-                driver, code_xpath, max_wait_sec=INITIAL_WAIT, logger=logger
-            )
-            if code:
-                if logger:
-                    logger(f"验证码获取成功: {code}")
-                try:
-                    driver.close()  # Close code tab
-                    driver.switch_to.window(main_handle)
-                except Exception:
-                    pass
-                return code
-
-            # 2. Refresh & Second Detection
-            if logger:
-                logger("未检测到验证码，刷新页面...")
-            try:
-                driver.refresh()
-                # Wait for ready state
-                try:
-                    WebDriverWait(driver, 5).until(
-                        lambda d: (
-                            d.execute_script("return document.readyState") == "complete"
-                        )
-                    )
-                except Exception:
-                    pass
-            except Exception as e:
-                if logger:
-                    logger(f"刷新失败: {e}")
-
-            if logger:
-                logger(f"刷新后检测验证码 ({REFRESH_WAIT}s)...")
-            code = wait_extract_code(
-                driver, code_xpath, max_wait_sec=REFRESH_WAIT, logger=logger
-            )
-            if code:
-                if logger:
-                    logger(f"验证码获取成功 (刷新后): {code}")
-                try:
-                    driver.close()
-                    driver.switch_to.window(main_handle)
-                except Exception:
-                    pass
-                return code
-
-            # 3. Resend Flow (if not last attempt)
-            if attempt < max_retries - 1:
-                if logger:
-                    logger("仍未检测到，执行重发流程...")
-                try:
-                    # Switch to Main Tab
-                    driver.switch_to.window(main_handle)
-
-                    # Locate and Click Resend
-                    resend_xp = resend_xpath or "//a[contains(text(), 'Resend Code')]"
-                    if logger:
-                        logger(f"查找重发按钮: {resend_xp}")
-
-                    clicked = safe_click_any(
-                        driver,
-                        [
-                            resend_xp,
-                            "//*[contains(text(), 'Resend')]",
-                            "//*[contains(@class, 'highlight')]",
-                        ],
-                        5000,
-                        1000,
-                        logger,
-                    )
-
-                    if clicked:
-                        if logger:
-                            logger(f"已点击重发按钮，等待 {RESEND_WAIT}s...")
-                        time.sleep(RESEND_WAIT)
-                    else:
-                        if logger:
-                            logger("❌ 未找到重发按钮，跳过重发步骤")
-
-                    # Switch back to Code Tab
-                    if code_tab_handle:
-                        driver.switch_to.window(code_tab_handle)
-                        # Refresh again to see new email? Usually good practice
-                        driver.refresh()
-
-                except Exception as e:
-                    if logger:
-                        logger(f"重发流程异常: {e}")
-                    # Try to recover focus to code tab
-                    try:
-                        if code_tab_handle:
-                            driver.switch_to.window(code_tab_handle)
-                    except Exception:
-                        pass
-            else:
-                if logger:
-                    logger("已达到最大重试次数，放弃")
-
-    except Exception as e:
-        if logger:
-            logger(f"接码流程严重异常: {e}")
-    finally:
-        # Ensure we close the code tab and return to main
-        try:
-            current = driver.current_window_handle
-            if current != main_handle:
-                driver.close()
-            driver.switch_to.window(main_handle)
-        except Exception:
-            try:
-                driver.switch_to.window(main_handle)
-            except Exception:
-                pass
-
-    return None
-
-
-def get_verification_code(
-    driver: webdriver.Remote,
-    code_url: str,
-    code_xpath: Optional[str] = None,
-    retries: int = MAX_CODE_RETRIES,
-    wait_seconds: int = 5,
-    logger: Optional[Callable[[str], None]] = None,
-) -> Optional[str]:
-    """Get verification code by opening a new tab."""
-    main_handle = driver.current_window_handle
-    for i in range(retries):
-        try:
-            if logger:
-                logger(f"打开接码标签尝试 {i + 1}/{retries}: {code_url}")
-            driver.switch_to.new_window("tab")
-            try:
-                driver.get(code_url)
-            except Exception as nav_err:
-                if logger:
-                    logger(f"直接导航失败，尝试JS打开: {nav_err}")
-                try:
-                    driver.execute_script(
-                        "window.open(arguments[0], '_blank')", code_url
-                    )
-                except Exception as js_err:
-                    if logger:
-                        logger(f"JS window.open 失败: {js_err}")
-            time.sleep(1)  # Reduced from wait_seconds
-            code = wait_extract_code(driver, code_xpath, max_wait_sec=15, logger=logger)
-            driver.close()
-            driver.switch_to.window(main_handle)
-            if code:
-                if logger:
-                    logger("接码成功，返回主标签")
-                return code
-        except Exception as e:
-            if logger:
-                logger(f"接码标签异常: {e}")
-            try:
-                driver.close()
-            except Exception:
-                pass
-            try:
-                driver.switch_to.window(main_handle)
-            except Exception:
-                pass
-        time.sleep(2)
-    return None
-
-
-# =============================================================================
 # BROWSER UTILITIES
 # =============================================================================
 
@@ -2209,286 +1817,58 @@ def extract_verification_code_unified(
     timeout: int = CODE_EXTRACTION_TIMEOUT_SEC,
     proxy_config: Optional[Dict[str, Any]] = None,
     stop_event: Optional[threading.Event] = None,
-    extraction_mode: str = "imap",
-    extraction_url: Optional[str] = None,
     email_pool: Optional[Any] = None,
 ) -> Optional[str]:
-    """
-    Unified verification code extraction using src.captcha_receiver and UI interaction (Resend Code).
-    Optimized to reuse IMAP connection.
-    Supports both IMAP and HTTP (XinLan) modes.
-
-    Args:
-        driver: Selenium WebDriver instance
-        email_addr: Email address for IMAP mode
-        password: Password or auth code
-        resend_xpath: XPath for resend button
-        logger: Optional logging function
-        timeout: Maximum time to wait for code
-        proxy_config: Proxy configuration for IMAP
-        stop_event: Event to check for cancellation
-        extraction_mode: 'imap' or 'http'
-        extraction_url: URL for HTTP mode
-
-    Returns:
-        Verification code if found, None otherwise
-    """
     if logger:
-        logger(f"Unified Captcha: Start (Email: {email_addr}) Mode: {extraction_mode}")
-        if proxy_config:
-            logger(
-                f"Unified Captcha: Using Proxy {proxy_config.get('addr')}:{proxy_config.get('port')}"
-            )
-
+        logger(f"Unified Captcha: Start (Email: {email_addr}) Mode: IMAP")
     start_time = time.time()
-    max_retries = 3  # As per new requirement (User requested max 3)
+    max_retries = 3
 
-    # Ensure we are on the right window
     main_handle = driver.current_window_handle
+    use_imap_proxy = os.getenv("DISABLE_IMAP_PROXY", "false").lower() != "true"
+    imap_proxy = proxy_config if use_imap_proxy else None
 
-    # Initialize MailExtractor once (Only for IMAP)
     extractor = None
-    imap_proxy = None
-
-    if extraction_mode == "imap":
-        # NOTE: Updated to use proxy for IMAP by default to avoid blocking by email providers (e.g. 163.com)
-        # User Request: Use the same proxy as the browser window.
-        # We allow disabling it via env var "DISABLE_IMAP_PROXY" just in case.
-        use_imap_proxy = os.getenv("DISABLE_IMAP_PROXY", "false").lower() != "true"
-        imap_proxy = proxy_config if use_imap_proxy else None
-
-        if logger and proxy_config:
-            if use_imap_proxy:
-                logger(
-                    f"Unified Captcha: IMAP Proxy ENABLED (Addr: {proxy_config.get('addr')})"
-                )
-            else:
-                logger(
-                    "Unified Captcha: IMAP Proxy disabled via env var DISABLE_IMAP_PROXY"
-                )
-
-        try:
-            extractor = MailExtractor(
-                email_addr, password, proxy_config=imap_proxy, logger=logger
+    try:
+        extractor = MailExtractor(
+            email_addr, password, proxy_config=imap_proxy, logger=logger
+        )
+    except Exception as e:
+        if logger:
+            logger(f"Unified Captcha: ❌ 初始化邮箱连接失败: {e}")
+        if email_pool:
+            email_pool.update_status(
+                email_addr, "problem", reason=f"IMAP登录失败: {str(e)}"
             )
-        except Exception as e:
-            if logger:
-                logger(f"Unified Captcha: ❌ 初始化邮箱连接失败: {e}")
-            if email_pool:
-                try:
-                    reason = f"IMAP登录失败: {str(e)}"
-                    email_pool.update_status(email_addr, "problem", reason=reason)
-                    if logger:
-                        logger(f"邮箱 {email_addr} 已被自动标记为问题邮箱。")
-                except Exception as pool_e:
-                    if logger:
-                        logger(f"标记问题邮箱失败: {pool_e}")
-            return None
+        return None
 
     try:
         for attempt in range(max_retries):
             if stop_event and stop_event.is_set():
-                if logger:
-                    logger("Unified Captcha: Stopped by user")
                 return None
-
             if time.time() - start_time > timeout:
-                if logger:
-                    logger("Unified Captcha: Timeout")
                 break
 
             if logger:
                 logger(f"=== 接码轮次 {attempt + 1}/{max_retries} ===")
-                logger(f"步骤: 正在获取验证码 ({extraction_mode})...")
-
-            # Call backend to get captcha
-            poll_timeout = 25  # Increased for robustness
+            poll_timeout = 25
             t_poll_start = time.time()
             code = None
 
-            # Inner poll loop
-            if extraction_mode == "http":
-                # XinLan HTTP Mode - Optimized
-                new_tab_handle = None
+            while time.time() - t_poll_start < poll_timeout:
+                if stop_event and stop_event.is_set():
+                    return None
                 try:
-                    if logger:
-                        logger(
-                            f"Unified Captcha: 开始HTTP获取流程 (Attempt {attempt + 1})..."
+                    if not extractor:
+                        extractor = MailExtractor(
+                            email_addr, password, proxy_config=imap_proxy, logger=logger
                         )
-
-                    # 1. Open Tab (Once per attempt)
-                    driver.execute_script("window.open('');")
-                    new_tab_handle = driver.window_handles[-1]
-                    driver.switch_to.window(new_tab_handle)
-
-                    # 2. Navigate
-                    if logger:
-                        logger(f"Unified Captcha: 打开提取URL: {extraction_url}")
-                    driver.set_page_load_timeout(30)
-                    driver.get(extraction_url or "")
-
-                    # 3. Polling Loop
-                    check_count = 0
-                    last_refresh_time = time.time()  # Track last refresh
-
-                    while time.time() - t_poll_start < poll_timeout:
-                        if stop_event and stop_event.is_set():
-                            break
-                        check_count += 1
-
-                        try:
-                            # NOTE: Do NOT refresh at start. Check content first!
-                            # Refresh only if necessary (long time no update).
-
-                            # Wait for body presence (fast check)
-                            try:
-                                WebDriverWait(driver, 5).until(
-                                    EC.presence_of_element_located(
-                                        (By.TAG_NAME, "body")
-                                    )
-                                )
-                            except Exception:
-                                if logger:
-                                    logger(
-                                        "Unified Captcha: ⚠️ 页面加载超时或body未找到"
-                                    )
-                                driver.refresh()
-                                time.sleep(2)
-                                continue
-
-                            # Strategy 1: Specific Element (#msg2) - Primary
-                            try:
-                                msg2_element = WebDriverWait(driver, 1).until(
-                                    EC.presence_of_element_located((By.ID, "msg2"))
-                                )
-                                msg2_text = msg2_element.text.strip()
-
-                                # Log found content for debugging
-                                if msg2_text and logger:
-                                    logger(
-                                        f"Unified Captcha: 发现 #msg2 元素, 内容: '{msg2_text}'"
-                                    )
-
-                                # Verify if it looks like a code (6 digits)
-                                if re.match(r"^\d{6}$", msg2_text):
-                                    code = msg2_text
-                                    if logger:
-                                        logger(
-                                            f"Unified Captcha: ✅ 通过 #msg2 提取成功: {code}"
-                                        )
-                                    break
-                            except Exception:
-                                pass  # Fallback to regex
-
-                            # Strategy 2: Body Regex - Fallback
-                            body_element = driver.find_element(By.TAG_NAME, "body")
-                            body_text = body_element.text
-
-                            # Regex Logic (Enhanced)
-                            # 1. Strict isolated 6 digits
-                            matches = re.findall(r"\b\d{6}\b", body_text)
-                            temp_code = matches[0] if matches else None
-
-                            # 2. Loose 6 digits
-                            if not temp_code:
-                                matches = re.findall(r"\d{6}", body_text)
-                                temp_code = matches[0] if matches else None
-
-                            if temp_code:
-                                code = temp_code
-                                if logger:
-                                    logger(
-                                        f"Unified Captcha: HTTP提取成功 (Regex): {code}"
-                                    )
-                                break
-                            else:
-                                if logger:
-                                    logger(
-                                        "Unified Captcha: 未找到验证码... (Retry in 2s)"
-                                    )
-
-                                # Refresh Logic: Only refresh if it's been > 10s since last refresh/load
-                                # This allows JS to update the page without us wiping it out constantly
-                                if time.time() - last_refresh_time > 10:
-                                    if logger:
-                                        logger(
-                                            "Unified Captcha: 页面无变化超过10秒，尝试刷新..."
-                                        )
-                                    driver.refresh()
-                                    last_refresh_time = time.time()
-                                    time.sleep(2)  # Wait for reload
-
-                        except Exception as e:
-                            if logger:
-                                logger(f"Unified Captcha: ⚠️ 提取循环异常: {e}")
-
-                        time.sleep(2)  # Short sleep to allow JS updates
-
+                    code = extractor.get_latest_verification_code()
+                    if code:
+                        break
                 except Exception as e:
-                    if logger:
-                        logger(f"Unified Captcha: ⚠️ HTTP模式致命错误: {e}")
-                finally:
-                    # Cleanup Tab
-                    try:
-                        if new_tab_handle:
-                            current_handles = driver.window_handles
-                            if new_tab_handle in current_handles:
-                                driver.switch_to.window(new_tab_handle)
-                                driver.close()
-                        driver.switch_to.window(main_handle)
-                    except Exception as close_err:
-                        if logger:
-                            logger(f"Unified Captcha: 标签页清理异常: {close_err}")
-                        try:
-                            driver.switch_to.window(main_handle)
-                        except Exception:
-                            pass
-
-            else:
-                # IMAP Mode
-                check_count = 0
-                while time.time() - t_poll_start < poll_timeout:
-                    if stop_event and stop_event.is_set():
-                        return None
-                    check_count += 1
-
-                    try:
-                        # Ensure extractor is alive
-                        if not extractor:
-                            if logger:
-                                logger(
-                                    "Unified Captcha: Re-initializing MailExtractor..."
-                                )
-                            extractor = MailExtractor(
-                                email_addr,
-                                password,
-                                proxy_config=imap_proxy,
-                                logger=logger,
-                            )
-
-                        if logger:
-                            logger(f"Unified Captcha: 第 {check_count} 次检查邮箱...")
-                        code = extractor.get_latest_verification_code()
-                        if code:
-                            break
-                    except Exception as e:
-                        if logger:
-                            logger(f"Unified Captcha: ⚠️ 邮箱检查异常: {e}")
-                        # Try to reconnect if needed
-                        try:
-                            if extractor:
-                                try:
-                                    if hasattr(extractor, "close"):
-                                        extractor.close()
-                                    elif hasattr(extractor, "logout"):
-                                        extractor.logout()
-                                except Exception:
-                                    pass
-                            extractor = None  # Force re-init next loop
-                        except Exception:
-                            pass
-                        time.sleep(1)
-                    time.sleep(3)
+                    extractor = None
+                time.sleep(3)
 
             if (
                 code
@@ -2498,62 +1878,26 @@ def extract_verification_code_unified(
                 if logger:
                     logger(f"Unified Captcha: ✅ 成功获取验证码: {code}")
                 return code
-            else:
-                if logger:
-                    logger(f"Unified Captcha: ❌ 本轮未检测到验证码 (code={code})")
 
-            # If not found, try Resend
             if attempt < max_retries - 1:
                 if logger:
                     logger("Unified Captcha: 尝试点击重发按钮 (Resend Code)...")
                 try:
-                    # Ensure focus
-                    try:
-                        driver.switch_to.window(main_handle)
-                        driver.switch_to.default_content()  # Ensure we are not in an iframe
-                    except Exception:
-                        pass
-
+                    driver.switch_to.window(main_handle)
                     resend_xp = resend_xpath or "//a[contains(text(), 'Resend Code')]"
-
-                    # Check visibility
                     if element_visible(driver, resend_xp, 3000, 1000):
-                        if js_click_xpath(driver, resend_xp):
-                            if logger:
-                                logger("Unified Captcha: ✅ 已点击重发按钮")
-                        else:
-                            # Fallback click
-                            el = driver.find_element(By.XPATH, resend_xp)
-                            el.click()
-                            if logger:
-                                logger("Unified Captcha: ✅ 已点击重发按钮 (原生)")
-
-                        if logger:
-                            logger("Unified Captcha: 等待邮件发送 (5s)...")
-                        time.sleep(8)  # Wait for email delivery
-                    else:
-                        if logger:
-                            logger(
-                                f"Unified Captcha: ⚠️ 重发按钮不可见: {resend_xp}，可能还在冷却中"
-                            )
-                        # Still wait a bit before next check
-                        time.sleep(3)
-                except Exception as e:
-                    if logger:
-                        logger(f"Unified Captcha: ⚠️ 重发操作异常: {e}")
-
+                        js_click_xpath(driver, resend_xp) or driver.find_element(
+                            By.XPATH, resend_xp
+                        ).click()
+                        time.sleep(5)  # 等待邮件发送
+                except Exception:
+                    pass
     finally:
         if extractor:
             try:
-                if hasattr(extractor, "close"):
-                    extractor.close()
-                elif hasattr(extractor, "logout"):
-                    extractor.logout()
+                extractor.close()
             except Exception:
                 pass
-
-    if logger:
-        logger("Unified Captcha: ❌ 达到最大重试次数，接码失败")
     return None
 
 
@@ -2849,19 +2193,7 @@ def step_write(
         if logger:
             logger("步骤: 打开语言菜单")
         lang_clicked = True
-        try:
-            WebDriverWait(driver, min(timeout_ms, 8000) / 1000.0).until(
-                EC.presence_of_element_located(
-                    (
-                        By.XPATH,
-                        xpaths.get("english_option")
-                        or xpaths.get("english_option_alt")
-                        or "//*[@role='menu']",
-                    )
-                )
-            )
-        except Exception:
-            pass
+
         if not safe_click_any(
             driver,
             [xpaths.get("english_option"), xpaths.get("english_option_alt")],
@@ -2967,20 +2299,6 @@ def step_write(
     ):
         raise RuntimeError(ERROR_SIGNIN_CLICK_FAILED)
 
-    try:
-        WebDriverWait(driver, min(timeout_ms, 10000) / 1000.0).until(
-            EC.presence_of_element_located(
-                (
-                    By.XPATH,
-                    xpaths.get("signin_with_email")
-                    or xpaths.get("signin_with_email_alt")
-                    or "//*",
-                )
-            )
-        )
-    except Exception:
-        pass
-
     if logger:
         logger("步骤: 选择邮箱登录")
     if not safe_click_any(
@@ -2996,19 +2314,6 @@ def step_write(
     ):
         raise RuntimeError(ERROR_SIGNIN_EMAIL_CLICK_FAILED)
 
-    try:
-        WebDriverWait(driver, min(timeout_ms, 10000) / 1000.0).until(
-            EC.presence_of_element_located(
-                (
-                    By.XPATH,
-                    xpaths.get("Sign up for free")
-                    or "//*[contains(text(),'免费') or contains(text(),'注册') or contains(text(),'Sign up')]",
-                )
-            )
-        )
-    except Exception:
-        pass
-
     if logger:
         logger("步骤: 点击免费注册")
     if not safe_click_any(
@@ -3023,19 +2328,6 @@ def step_write(
         retries=2,
     ):
         raise RuntimeError(ERROR_SIGNUP_CLICK_FAILED)
-
-    try:
-        WebDriverWait(driver, min(timeout_ms, 12000) / 1000.0).until(
-            EC.presence_of_element_located(
-                (
-                    By.XPATH,
-                    xpaths.get("Enter Email Address")
-                    or "//*[@placeholder][contains(@placeholder,'邮箱') or contains(@placeholder,'Email')]",
-                )
-            )
-        )
-    except Exception:
-        pass
 
     # Form Filling
     if logger:
@@ -3188,7 +2480,7 @@ def step_write(
 
     if logger:
         logger("步骤: 滑块通过，强制等待 5 秒...")
-    time.sleep(8)
+    time.sleep(1)
     if logger:
         logger("步骤: 滑块通过，立即跳转接码页等待验证码")
 
@@ -3236,14 +2528,6 @@ def step_confirm(
             logger("❌ 错误: 缺少密码/授权码，无法获取验证码。")
         raise RuntimeError(ERROR_MISSING_CREDENTIALS)
 
-    # Determine Mode
-    auth_code_or_url = str(row.get("auth_code") or row.get("授权码") or "").strip()
-    extraction_mode = "imap"
-    extraction_url = None
-    if auth_code_or_url.startswith("http"):
-        extraction_mode = "http"
-        extraction_url = auth_code_or_url
-
     # Proxy for IMAP
     proxy_config = None
     host = str(row.get("host") or row.get("代理IP") or "").strip()
@@ -3289,8 +2573,6 @@ def step_confirm(
         timeout=CODE_EXTRACTION_TIMEOUT_SEC,
         proxy_config=proxy_config,
         stop_event=stop_event,
-        extraction_mode=extraction_mode,
-        extraction_url=extraction_url,
         email_pool=email_pool,
     )
 
@@ -3401,38 +2683,24 @@ def step_confirm(
     find_click_any(driver, xpaths["final_submit_btn"], timeout_ms, poll_ms)
 
     if logger:
-        logger("提交后强制等待 6 秒...")
-    time.sleep(6)
-
-    # 注册跳转流程重定义 (User Request 2)
-    if logger:
-        logger("步骤: 提交注册")
-        logger("步骤: 等待URL跳转 (成功标志)...")
-
+        logger("步骤: 等待URL跳转或注册成功标志...")
     jump_success = False
     try:
-
-        def check_url_jump(d):
-            u = d.current_url.lower()
-            if any(k in u for k in SUCCESS_URL_KEYWORDS):
-                return True
-            return False
-
-        WebDriverWait(driver, 15).until(check_url_jump)
+        # 智能等待：只要 URL 变了或者页面出现了成功关键词，立刻通过，绝不干等
+        WebDriverWait(driver, 15).until(
+            lambda d: (
+                any(k in d.current_url.lower() for k in SUCCESS_URL_KEYWORDS)
+                or "dashboard" in d.find_element(By.TAG_NAME, "body").text.lower()
+            )
+        )
         jump_success = True
-        if logger:
-            logger(f"检测到URL跳转成功: {driver.current_url}")
-    except Exception as e:
-        if logger:
-            logger(f"等待URL跳转超时或失败: {e}")
-        try:
-            body_text = driver.find_element(By.TAG_NAME, "body").text
-            if "You have signed in" in body_text or "dashboard" in body_text.lower():
-                if logger:
-                    logger("通过页面内容检测到注册成功")
-                jump_success = True
-        except Exception:
-            pass
+    except Exception:
+        pass
+
+    if not jump_success:
+        raise RuntimeError(ERROR_URL_JUMP_FAILED)
+
+    time.sleep(1)  # 跳转成功后稍作稳定
 
     if not jump_success:
         raise RuntimeError(ERROR_URL_JUMP_FAILED)
