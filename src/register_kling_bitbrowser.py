@@ -886,7 +886,7 @@ def safe_click(
         try:
             WebDriverWait(
                 driver,
-                min(timeout_ms, 12000) / 1000.0,
+                timeout_ms / 1000.0,
                 poll_frequency=max(0.2, poll_ms / 1000.0),
             ).until(EC.element_to_be_clickable((By.XPATH, xpath))).click()
             return True
@@ -894,7 +894,7 @@ def safe_click(
             try:
                 el = WebDriverWait(
                     driver,
-                    min(timeout_ms, 12000) / 1000.0,
+                    timeout_ms / 1000.0,
                     poll_frequency=max(0.2, poll_ms / 1000.0),
                 ).until(EC.presence_of_element_located((By.XPATH, xpath)))
                 driver.execute_script(
@@ -921,7 +921,8 @@ def first_present_xpath(
     if not valid_xpaths:
         return None
 
-    eff_timeout = min(timeout_ms, 12000) / 1000.0  # 最大等待12秒
+    # 彻底去掉 12 秒的硬限制，完全尊重 UI 面板传进来的 timeout_ms（比如 30000 或 60000）
+    eff_timeout = timeout_ms / 1000.0
     eff_poll = max(0.2, poll_ms / 1000.0)
     end_time = time.time() + eff_timeout
 
@@ -936,7 +937,7 @@ def first_present_xpath(
             except Exception:
                 continue
         time.sleep(eff_poll)
-    
+
     return None
 
 
@@ -993,7 +994,7 @@ def safe_send_keys(
         try:
             el = WebDriverWait(
                 driver,
-                min(timeout_ms, 12000) / 1000.0,
+                timeout_ms / 1000.0,
                 poll_frequency=max(0.2, poll_ms / 1000.0),
             ).until(EC.presence_of_element_located((By.XPATH, xpath)))
             el.send_keys(text)
@@ -1531,11 +1532,11 @@ def open_attached_driver(
 
             # 设置超时 - 防止长时间阻塞
             try:
-                driver.set_page_load_timeout(30)  # 页面加载超时30秒
+                driver.set_page_load_timeout(60)  # 页面加载超时30秒
             except Exception:
                 pass
             try:
-                driver.set_script_timeout(30)  # JS执行超时30秒
+                driver.set_script_timeout(60)  # JS执行超时30秒
             except Exception:
                 pass
             try:
@@ -1984,7 +1985,7 @@ def step_verify(
         logger(f"create_profile {window_name}")
 
     # Optimization: Disable QUIC
-    browser_cmd_args = ["--disable-quic"]
+    browser_cmd_args = ["--disable-quic", "--window-size=800,550"]
 
     browser_id = None
     try:
@@ -2075,6 +2076,12 @@ def step_verify(
     ctx["t_attached"] = time.time()
     ctx["gate_state"] = "attached"
 
+    # 强制设置比特浏览器窗口大小
+    try:
+        driver.set_window_size(800, 550)
+    except Exception:
+        pass
+
     # Headless Mode
     if headless_mode:
         try:
@@ -2098,29 +2105,47 @@ def step_verify(
     log_page_timing(driver, logger)
     log_resource_status(driver, logger)
 
-    # DOM Check
+    # DOM Check (智能弹性等待：不设死板时间，根据 UI 的超时设置灵活探测核心元素)
     try:
-        if not element_visible(
-            driver, xpaths.get("language_menu", ""), min(timeout_ms, 30000), poll_ms
-        ):
+        if logger:
+            logger("步骤: 智能等待页面核心元素加载...")
+
+        # 将我们关心的核心入口汇总
+        core_xpaths = [
+            xpaths.get("language_menu"),
+            xpaths.get("language_menu_alt"),
+            xpaths.get("signin_btn"),
+            xpaths.get("Creative Studio"),
+            "//*[contains(text(), 'Sign In') or contains(text(), '登录')]",
+        ]
+
+        # 使用你 UI 上配置的最大超时时间 (timeout_ms) 进行智能探测
+        found_element = first_present_xpath(driver, core_xpaths, timeout_ms, poll_ms)
+
+        if not found_element:
             if logger:
-                logger("DOM状态校验失败: language_menu 未可见 (30s)，尝试刷新后重试")
+                logger("DOM状态检测超时：页面可能卡白屏或代理极慢，尝试刷新补救...")
             try:
                 driver.refresh()
+                wait_page_ready(driver, 30)
             except Exception:
                 pass
-            wait_page_ready(driver, 45)
-            log_page_timing(driver, logger)
-            log_resource_status(driver, logger)
-            if not element_visible(
-                driver, xpaths.get("language_menu", ""), min(timeout_ms, 30000), poll_ms
-            ):
+
+            # 刷新后进行最后一次探测
+            found_element = first_present_xpath(
+                driver, core_xpaths, timeout_ms, poll_ms
+            )
+
+            if not found_element:
                 if logger:
-                    logger(
-                        "DOM状态校验仍失败: language_menu 未可见，继续后续入口以免阻塞"
-                    )
-    except Exception:
-        pass
+                    logger("警告：二次刷新后核心元素仍未就绪，强制进入下一步(可能报错)")
+        else:
+            if logger:
+                logger("页面核心元素已就绪，进入交互流程。")
+
+    except Exception as e:
+        if logger:
+            logger(f"DOM 校验阶段发生异常: {e}")
 
 
 def step_write(
