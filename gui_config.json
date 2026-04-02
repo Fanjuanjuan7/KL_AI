@@ -2,17 +2,17 @@
   "xpaths": "config/kling_xpaths.json",
   "bit_url": "http://127.0.0.1:54345",
   "bit_secret": "",
-  "platform_url": "https://klingai.com/global/",
-  "concurrency": 3,
+  "platform_url": "https://kling.ai",
+  "concurrency": 1,
   "timeout_ms": 50000,
   "poll_ms": 500,
   "build_output": "dist",
-  "ip_def_port": "47682",
-  "ip_def_user": "UynqJZjUMD",
-  "ip_def_pass": "F4qDNjjBHg",
+  "ip_def_port": "50000",
+  "ip_def_user": "fanjuanjuan",
+  "ip_def_pass": "123456",
   "ip_def_protocol": "socks5",
   "ip_config_path": "config/ip_pool.json",
   "udp_enabled": false,
   "email_mode": "IMAP模式",
-  "target_reg_count": "16"
+  "target_reg_count": "1"
 }
