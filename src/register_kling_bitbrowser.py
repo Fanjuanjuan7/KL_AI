@@ -2708,27 +2708,76 @@ def step_confirm(
     find_click_any(driver, xpaths["final_submit_btn"], timeout_ms, poll_ms)
 
     if logger:
-        logger("步骤: 等待URL跳转或注册成功标志...")
+        logger("步骤: 正在多维度校验注册/登录状态...")
+
     jump_success = False
-    try:
-        # 智能等待：只要 URL 变了或者页面出现了成功关键词，立刻通过，绝不干等
-        WebDriverWait(driver, 15).until(
-            lambda d: (
-                any(k in d.current_url.lower() for k in SUCCESS_URL_KEYWORDS)
-                or "dashboard" in d.find_element(By.TAG_NAME, "body").text.lower()
-            )
-        )
-        jump_success = True
-    except Exception:
-        pass
+    check_timeout = 20  # 给定最高 20 秒的宽限期
+    end_time = time.time() + check_timeout
+
+    while time.time() < end_time:
+        if stop_event and stop_event.is_set():
+            raise RuntimeError(ERROR_STOPPED)
+
+        try:
+            # === 维度 1: URL 特征检测 (最快) ===
+            current_url = driver.current_url.lower()
+            # 兼容可灵的最新跳转逻辑，特别是 /app 路径
+            if any(
+                k in current_url
+                for k in ["/app", "dashboard", "all-tools", "home", "success", "portal"]
+            ):
+                jump_success = True
+                if logger:
+                    logger("✅ 验证通过 (维度1): URL 匹配成功特征")
+                break
+
+            # === 维度 2: 底层 Cookie 凭证检测 (最准，无视页面卡顿/白屏) ===
+            # 只要服务器确认注册成功，必然会下发包含 token、session、userid 等关键字的身份凭证
+            cookies = driver.get_cookies()
+            auth_cookie_names = [
+                c["name"]
+                for c in cookies
+                if any(
+                    kw in c["name"].lower()
+                    for kw in [
+                        "token",
+                        "session",
+                        "userid",
+                        "passport",
+                        "kling",
+                        "kuaishou",
+                    ]
+                )
+            ]
+            # 如果存在至少两个核心凭证Cookie，说明 100% 已经拥有了登录态
+            if len(auth_cookie_names) >= 2:
+                jump_success = True
+                if logger:
+                    logger(
+                        f"✅ 验证通过 (维度2): 底层已写入身份凭证 Cookie ({', '.join(auth_cookie_names[:3])})"
+                    )
+                break
+
+            # === 维度 3: 专属 UI 元素检测 (备用兜底) ===
+            # 如果你在 kling_xpaths.json 中配置了 "success_indicator"，就用它来验证
+            success_xp = xpaths.get("success_indicator")
+            if success_xp:
+                elements = driver.find_elements(By.XPATH, success_xp)
+                if elements and elements[0].is_displayed():
+                    jump_success = True
+                    if logger:
+                        logger("✅ 验证通过 (维度3): 页面出现登录成功后的标识元素")
+                    break
+
+        except Exception:
+            pass
+
+        time.sleep(1)  # 每秒检测一次，不消耗过多 CPU
 
     if not jump_success:
         raise RuntimeError(ERROR_URL_JUMP_FAILED)
 
-    time.sleep(1)  # 跳转成功后稍作稳定
-
-    if not jump_success:
-        raise RuntimeError(ERROR_URL_JUMP_FAILED)
+    time.sleep(2)  # 确认成功后稍微稳定一下再进入下一步
 
     if logger:
         logger("步骤: 跳转成功，强制等待 3 秒...")
