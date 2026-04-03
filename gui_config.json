@@ -13,6 +13,7 @@
   "ip_def_protocol": "socks5",
   "ip_config_path": "config/ip_pool.json",
   "udp_enabled": false,
+  "save_traffic": false,
   "email_mode": "IMAP模式",
   "target_reg_count": "1"
 }

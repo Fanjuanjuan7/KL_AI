@@ -174,6 +174,7 @@ class App(*BaseClasses):
         self.cnt_fail_var = tkinter.StringVar(value="0")
         self.headless_mode_var = tkinter.BooleanVar(value=False)
         self.udp_var = tkinter.BooleanVar(value=False)
+        self.save_traffic_var = tkinter.BooleanVar(value=False)  # 新增：省流量变量
         self.stop_event = threading.Event()
         self.worker = None
 
@@ -704,6 +705,10 @@ class App(*BaseClasses):
             ctk.CTkCheckBox(f, text="启用UDP", variable=self.udp_var, width=80).pack(
                 side="left", padx=2
             )
+            # --- 新增省流量模式勾选框 ---
+            ctk.CTkCheckBox(
+                f, text="省流量模式", variable=self.save_traffic_var, width=110
+            ).pack(side="left", padx=2)
             return f
 
         add_config_row(grid_frame, 3, 1, "运行模式:", create_run_mode)
@@ -2499,11 +2504,6 @@ class App(*BaseClasses):
             self.append_log(f"❌ {error_msg}")
             messagebox.showerror("删除失败", error_msg)
 
-    def delete_selected_email(self):
-        """Delete single selected email (legacy method, kept for compatibility)."""
-        # Use batch delete for consistency
-        self.batch_delete_emails()
-
     def start_registration(self):
         if self.worker and self.worker.is_alive():
             return
@@ -2700,6 +2700,7 @@ class App(*BaseClasses):
                     headless_mode=self.headless_mode_var.get(),
                     udp_enabled=self.udp_var.get(),
                     events=events,
+                    save_traffic=self.save_traffic_var.get(),  # 新增：将界面开关传给后端
                 )
                 self.append_log("任务结束")
             except Exception as e:
@@ -2872,6 +2873,7 @@ class App(*BaseClasses):
             "ip_def_protocol": self.ip_def_protocol_var.get(),
             "ip_config_path": make_rel(self.ip_config_path_var.get()),
             "udp_enabled": self.udp_var.get(),
+            "save_traffic": self.save_traffic_var.get(),  # 新增：保存省流量设置
             "email_mode": self.email_mode_var.get(),
             "target_reg_count": self.target_reg_count_var.get(),
         }
@@ -2960,6 +2962,9 @@ class App(*BaseClasses):
             self.ip_def_pass_var.set(cfg.get("ip_def_pass", ""))
             self.ip_def_protocol_var.set(cfg.get("ip_def_protocol", "socks5"))
             self.udp_var.set(cfg.get("udp_enabled", False))
+            self.save_traffic_var.set(
+                cfg.get("save_traffic", False)
+            )  # 新增：加载省流量设置
             self.email_mode_var.set(cfg.get("email_mode", "IMAP模式"))
             self.target_reg_count_var.set(cfg.get("target_reg_count", "10"))
 

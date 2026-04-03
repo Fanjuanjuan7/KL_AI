@@ -1043,38 +1043,6 @@ def validate_xpaths(
     return result
 
 
-def find_click(
-    driver: webdriver.Remote, xpath: str, timeout_ms: int, poll_ms: int
-) -> None:
-    """Find and click an element."""
-    eff_timeout = min(timeout_ms, 60000)
-    WebDriverWait(driver, eff_timeout / 1000.0, poll_frequency=poll_ms / 1000.0).until(
-        EC.element_to_be_clickable((By.XPATH, xpath))
-    ).click()
-
-
-def find_click_any(
-    driver: webdriver.Remote, xpath: str, timeout_ms: int, poll_ms: int
-) -> None:
-    """Find and click an element with fallback strategies."""
-    try:
-        eff_timeout = min(timeout_ms, 60000)
-        WebDriverWait(
-            driver, eff_timeout / 1000.0, poll_frequency=poll_ms / 1000.0
-        ).until(EC.element_to_be_clickable((By.XPATH, xpath))).click()
-        return
-    except Exception:
-        eff_timeout = min(timeout_ms, 60000)
-        el = WebDriverWait(
-            driver, eff_timeout / 1000.0, poll_frequency=poll_ms / 1000.0
-        ).until(EC.presence_of_element_located((By.XPATH, xpath)))
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
-        try:
-            el.click()
-        except Exception:
-            driver.execute_script("arguments[0].click();", el)
-
-
 # =============================================================================
 # SLIDER UTILITIES
 # =============================================================================
@@ -1987,6 +1955,14 @@ def step_verify(
     # Optimization: Disable QUIC
     browser_cmd_args = ["--disable-quic", "--window-size=800,550"]
 
+    # --- 省流量模式逻辑 ---
+    if ctx.get("save_traffic"):
+        if logger:
+            logger("模式: 开启省流量模式，禁用图片加载")
+        # 核心：通过 Chrome 命令行禁用图片
+        browser_cmd_args.append("--blink-settings=imagesEnabled=false")
+    # --------------------
+
     browser_id = None
     try:
         browser_id = client.update_browser(
@@ -2100,16 +2076,22 @@ def step_verify(
         take_screenshot(driver, f"{window_name}_connectivity_failed.png", logger)
         raise RuntimeError(ERROR_PROXY_CONNECTIVITY_FAILED)
 
-    # Page Ready
-    wait_page_ready(driver, 45)
-    log_page_timing(driver, logger)
-    log_resource_status(driver, logger)
-
     # DOM Check (智能弹性等待：不设死板时间，根据 UI 的超时设置灵活探测核心元素)
     try:
         if logger:
             logger("步骤: 智能等待页面核心元素加载...")
-
+            # [健壮性优化] 极速探测 Cloudflare 拦截 (Fast-Fail)，绝不浪费时间死等
+        page_title = driver.title.lower()
+        if (
+            "just a moment" in page_title
+            or "attention required" in page_title
+            or "cloudflare" in page_title
+        ):
+            if logger:
+                logger(
+                    "🚫 致命拦截: 检测到 Cloudflare 验证盾，当前 IP 信誉极差，立即放弃本轮！"
+                )
+            raise RuntimeError("cloudflare_blocked")
         # 将我们关心的核心入口汇总
         core_xpaths = [
             xpaths.get("language_menu"),
@@ -2241,7 +2223,6 @@ def step_write(
     if stop_event and stop_event.is_set():
         raise RuntimeError(ERROR_STOPPED)
 
-    # Navigate to Sign Up
     if logger:
         logger("步骤: 点击 Creative Studio")
     if not safe_click_any(
@@ -2255,16 +2236,7 @@ def step_write(
         logger,
         retries=2,
     ):
-        try:
-            find_click(
-                driver,
-                xpaths.get("Creative Studio")
-                or "//*[contains(text(),'Creative') or contains(text(),'创意') or contains(text(),'工作室')]",
-                timeout_ms,
-                poll_ms,
-            )
-        except Exception as e:
-            raise RuntimeError(str(e))
+        raise RuntimeError("Creative Studio 点击失败")
 
     if logger:
         logger("步骤: 点击 More Tools")
@@ -2420,25 +2392,19 @@ def step_write(
 
     ctx["gate_state"] = "registration_started"
 
-    # Check Used Email
+    # Check Used Email (极速判断，弃用耗时的 body.text)
     try:
-        if element_visible(
-            driver,
-            "//*[contains(text(), 'registered') or contains(text(), 'used')]",
-            2000,
-            poll_ms,
-        ):
-            body_text = driver.find_element(By.TAG_NAME, "body").text.lower()
-            if (
-                "already registered" in body_text
-                or "already used" in body_text
-                or "account exists" in body_text
-            ):
-                if logger:
-                    logger("检测到邮箱已被使用提示")
-                if email_pool := ctx.get("email_pool"):
-                    email_pool.update_email_status(email, "fail_used")
-                raise RuntimeError(ERROR_EMAIL_USED_PROMPT)
+        # 直接定位包含具体错误信息的元素，最大等待 2.5 秒
+        error_xpaths: list[str | None] = [
+            "//*[contains(text(), 'already registered') or contains(text(), 'already used') or contains(text(), 'account exists')]",
+            "//*[contains(text(), '已注册') or contains(text(), '已被使用')]",
+        ]
+        if first_present_xpath(driver, error_xpaths, 2500, poll_ms):
+            if logger:
+                logger("🚫 检测到邮箱已被使用提示")
+            if email_pool := ctx.get("email_pool"):
+                email_pool.update_email_status(email, "fail_used")
+            raise RuntimeError(ERROR_EMAIL_USED_PROMPT)
     except RuntimeError as e:
         if str(e) == ERROR_EMAIL_USED_PROMPT:
             raise
@@ -2663,28 +2629,8 @@ def step_confirm(
         ]
         input_locators = list(dict.fromkeys([x for x in input_locators if x]))
 
-        found_input_xpath = None
-        for xp in input_locators:
-            try:
-                if element_visible(driver, xp, 1000, poll_ms):
-                    found_input_xpath = xp
-                    break
-            except Exception:
-                pass
-
-        if not found_input_xpath:
-            end_find = time.time() + 10
-            while time.time() < end_find:
-                for xp in input_locators:
-                    try:
-                        if element_visible(driver, xp, 500, poll_ms):
-                            found_input_xpath = xp
-                            break
-                    except Exception:
-                        pass
-                if found_input_xpath:
-                    break
-                time.sleep(1)
+        # 直接调用底层的极速并行探测函数，设定 10秒(10000ms) 超时
+        found_input_xpath = first_present_xpath(driver, input_locators, 10000, poll_ms)
 
         if not found_input_xpath:
             if logger:
@@ -2705,8 +2651,7 @@ def step_confirm(
 
     if logger:
         logger("步骤: 填写验证码")
-    find_click_any(driver, xpaths["final_submit_btn"], timeout_ms, poll_ms)
-
+    safe_click(driver, xpaths["final_submit_btn"], timeout_ms, poll_ms, logger)
     if logger:
         logger("步骤: 正在多维度校验注册/登录状态...")
 
@@ -2818,6 +2763,7 @@ def perform_registration(
     keep_open_on_failure_ms: int = 0,
     allow_hold_on_early_failure: bool = False,
     events: Optional[RegistrationEvents] = None,
+    save_traffic: bool = False,  # 新增
 ) -> Tuple[bool, str]:
     """
     Perform a single registration task using BitBrowser.
@@ -2884,6 +2830,7 @@ def perform_registration(
             "debug_tab_opened": False,
             "email_pool": email_pool,
             "udp_enabled": udp_enabled,
+            "save_traffic": save_traffic,  # 新增
         }
 
         # Resolve dynamic settings if they are callables
@@ -3079,6 +3026,7 @@ def run_batch(
     headless_mode: bool = False,
     udp_enabled: bool = False,
     events: Optional[RegistrationEvents] = None,
+    save_traffic: bool = False,  # 新增
 ) -> None:
     """
     Run batch registration tasks.
@@ -3330,6 +3278,7 @@ def run_batch(
                     keep_open_on_failure_ms=0,
                     allow_hold_on_early_failure=False,
                     events=events,
+                    save_traffic=save_traffic,  # 新增
                 )
                 if not ok:
                     if events and events.on_failure:
