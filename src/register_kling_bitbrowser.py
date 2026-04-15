@@ -46,7 +46,7 @@ PAGE_READY_TIMEOUT_SEC = 12
 CONNECTIVITY_MAX_WAIT_SEC = 30  # 增加网络检测等待时间
 SLIDER_MAX_WAIT_SEC = 60
 CODE_EXTRACTION_TIMEOUT_SEC = 400
-BROWSER_START_WAIT_SEC = 8  # 增加启动等待时间到8秒
+BROWSER_START_WAIT_SEC = 3  # 增加启动等待时间到8秒
 POST_SLIDER_WAIT_SEC = 5
 POST_SUBMIT_WAIT_SEC = 5  # 改为5秒，确保页面跳转完成
 
@@ -384,6 +384,7 @@ class BitBrowserClient:
         proxy: Optional[Dict[str, Any]] = None,
         enable_udp: bool = False,
         cmd_args: Optional[List[str]] = None,
+        save_traffic: bool = False,  # <--- 必须加上这一行
     ) -> str:
         payload: Dict[str, Any] = {
             "name": name,
@@ -397,6 +398,20 @@ class BitBrowserClient:
             "syncIndexedDb": True,
             "browserFingerPrint": {"coreVersion": "124"},
         }
+
+        # --- 新增：对接比特浏览器原生省流量 API ---
+        if save_traffic:
+            payload.update(
+                {
+                    "abortImage": True,  # 开启图片拦截
+                    "abortImageMaxSize": 100,  # ⚠️ 关键：允许加载 100KB 以下的图片（确保滑块正常）
+                    "abortAudio": True,  # 禁用声音
+                    "abortTranslate": True,  # 禁用谷歌翻译弹窗
+                    "abortCertificate": True,  # 禁用保存密码弹窗
+                }
+            )
+        # ---------------------------------------
+
         if cmd_args:
             payload["cmdArgs"] = cmd_args
         if proxy:
@@ -421,6 +436,7 @@ class BitBrowserClient:
         proxy: Optional[Dict[str, Any]] = None,
         enable_udp: bool = False,
         cmd_args: Optional[List[str]] = None,
+        save_traffic: bool = False,  # <--- 必须加上这一行
     ) -> str:
         payload: Dict[str, Any] = {
             "name": name,
@@ -434,6 +450,19 @@ class BitBrowserClient:
             "syncIndexedDb": True,
             "browserFingerPrint": {"coreVersion": "124"},
         }
+
+        # --- 新增：对接比特浏览器原生省流量 API ---
+        if save_traffic:
+            payload.update(
+                {
+                    "abortImage": True,
+                    "abortImageMaxSize": 100,  # 允许小图（滑块），拦截大图
+                    "abortAudio": True,
+                    "abortTranslate": True,
+                    "abortCertificate": True,
+                }
+            )
+
         if cmd_args:
             payload["cmdArgs"] = cmd_args
         if proxy:
@@ -827,10 +856,46 @@ def check_connectivity(
     """Check network connectivity by navigating to a URL."""
     ok = True
     try:
+        # 1. 强制页面加载超时时间，防止 driver.get 自身卡死
+        try:
+            driver.set_page_load_timeout(15)
+        except Exception:
+            pass
+
         try:
             driver.get(url)
         except Exception:
             driver.execute_script("window.location.href=arguments[0];", url)
+
+        # ==========================================
+        # 🚀 核心优化：代理失效极速熔断 (Fast-Fail)
+        # ==========================================
+        time.sleep(1)  # 给浏览器 1 秒钟渲染错误页面
+        try:
+            # 抓取页面源码（全部转大写方便匹配）
+            page_source = driver.page_source.upper()
+
+            # 定义 Chrome 常见的代理/网络致命错误代码
+            fatal_errors = [
+                "ERR_SOCKS_CONNECTION_FAILED",
+                "ERR_PROXY_CONNECTION_FAILED",
+                "ERR_CONNECTION_TIMED_OUT",
+                "ERR_CONNECTION_CLOSED",
+                "ERR_CONNECTION_RESET",
+                "ERR_TUNNEL_CONNECTION_FAILED",
+            ]
+
+            for err in fatal_errors:
+                if err in page_source:
+                    if logger:
+                        logger(
+                            f"🚫 极速熔断: 检测到致命网络错误 [{err}]，代理失效，立即放弃！"
+                        )
+                    return False  # 瞬间返回 False，终止当前任务
+        except Exception:
+            pass
+        # ==========================================
+
         wait_page_ready(driver, max_wait)
         log_page_timing(driver, logger)
         log_resource_status(driver, logger)
@@ -1812,55 +1877,42 @@ def extract_verification_code_unified(
         return None
 
     try:
-        for attempt in range(max_retries):
+        if logger:
+            logger(f"Unified Captcha: 开始监听邮件 (最大等待 {timeout} 秒)...")
+
+        t_poll_start = time.time()
+        code = None
+
+        # 只进行一个死循环监听，直到达到设定的总超时时间 (timeout)
+        while time.time() - t_poll_start < timeout:
             if stop_event and stop_event.is_set():
                 return None
-            if time.time() - start_time > timeout:
-                break
+            try:
+                if not extractor:
+                    extractor = MailExtractor(
+                        email_addr, password, proxy_config=imap_proxy, logger=logger
+                    )
+                code = extractor.get_latest_verification_code()
 
-            if logger:
-                logger(f"=== 接码轮次 {attempt + 1}/{max_retries} ===")
-            poll_timeout = 25
-            t_poll_start = time.time()
-            code = None
+                if (
+                    code
+                    and code not in ["未匹配到验证码", "未找到邮件"]
+                    and not code.startswith("错误:")
+                ):
+                    if logger:
+                        logger(f"Unified Captcha: ✅ 成功获取验证码: {code}")
+                    return code
+            except Exception as e:
+                extractor = None
 
-            while time.time() - t_poll_start < poll_timeout:
-                if stop_event and stop_event.is_set():
-                    return None
-                try:
-                    if not extractor:
-                        extractor = MailExtractor(
-                            email_addr, password, proxy_config=imap_proxy, logger=logger
-                        )
-                    code = extractor.get_latest_verification_code()
-                    if code:
-                        break
-                except Exception as e:
-                    extractor = None
-                time.sleep(3)
+            # 每隔 3 秒去邮箱拉取一次
+            time.sleep(3)
 
-            if (
-                code
-                and code not in ["未匹配到验证码", "未找到邮件"]
-                and not code.startswith("错误:")
-            ):
-                if logger:
-                    logger(f"Unified Captcha: ✅ 成功获取验证码: {code}")
-                return code
+        # 如果跳出了 while 循环，说明超过了 timeout 秒还没拿到，直接返回失败
+        if logger:
+            logger(f"Unified Captcha: ❌ {timeout} 秒内未收到验证码，放弃当前邮箱。")
+        return None
 
-            if attempt < max_retries - 1:
-                if logger:
-                    logger("Unified Captcha: 尝试点击重发按钮 (Resend Code)...")
-                try:
-                    driver.switch_to.window(main_handle)
-                    resend_xp = resend_xpath or "//a[contains(text(), 'Resend Code')]"
-                    if element_visible(driver, resend_xp, 3000, 1000):
-                        js_click_xpath(driver, resend_xp) or driver.find_element(
-                            By.XPATH, resend_xp
-                        ).click()
-                        time.sleep(5)  # 等待邮件发送
-                except Exception:
-                    pass
     finally:
         if extractor:
             try:
@@ -1953,31 +2005,30 @@ def step_verify(
         logger(f"create_profile {window_name}")
 
     # Optimization: Disable QUIC
+    # 原有的 browser_cmd_args 逻辑保持不动（作为双重保险）
     browser_cmd_args = ["--disable-quic", "--window-size=800,550"]
-
-    # --- 省流量模式逻辑 ---
     if ctx.get("save_traffic"):
-        if logger:
-            logger("模式: 开启省流量模式，禁用图片加载")
-        # 核心：通过 Chrome 命令行禁用图片
         browser_cmd_args.append("--blink-settings=imagesEnabled=false")
-    # --------------------
 
     browser_id = None
     try:
+        # ⚠️ 注意这里：增加了 save_traffic=ctx.get("save_traffic")
         browser_id = client.update_browser(
             window_name,
             proxy_payload(host, port, proxy_username, proxy_password, protocol),
             enable_udp=udp_enabled,
             cmd_args=browser_cmd_args,
+            save_traffic=ctx.get("save_traffic"),
         )
     except (requests.exceptions.RequestException, RuntimeError):
         try:
+            # ⚠️ 这里也要改
             browser_id = client.create_browser(
                 window_name,
                 proxy_payload(host, port, proxy_username, proxy_password, protocol),
                 enable_udp=udp_enabled,
                 cmd_args=browser_cmd_args,
+                save_traffic=ctx.get("save_traffic"),
             )
         except Exception as create_err:
             if logger:
@@ -2054,7 +2105,7 @@ def step_verify(
 
     # 强制设置比特浏览器窗口大小
     try:
-        driver.set_window_size(800, 550)
+        driver.set_window_size(800, 650)
     except Exception:
         pass
 
@@ -3439,75 +3490,67 @@ def run_batch(
             if remaining_needed <= 0:
                 break
 
-        # Inner Loop: Process Pending Tasks in Batches
-        # We process 'pending_idx' in chunks of 'concurrency'
-        round_tasks_indices = pending_idx[:]
-        chunk_size = concurrency
+        # --- 流水线持续并发模式 (解决“一波一波跑”的问题) ---
+        with lock:
+            remaining_needed = target_success_count - global_success_count
 
-        # Iterate chunks
-        for i in range(0, len(round_tasks_indices), chunk_size):
-            if stop_event and stop_event.is_set():
-                break
+        actual_tasks_indices = pending_idx[:remaining_needed]
 
-            # Check Global Target (Pre-batch check)
-            with lock:
-                if global_success_count >= target_success_count:
-                    if logger:
-                        logger(
-                            f"🛑 批次前检查: 已达到目标 ({global_success_count}/{target_success_count})"
-                        )
+        if not actual_tasks_indices:
+            break
+
+        if logger:
+            logger(
+                f"🚀 任务队列已载入: 共 {len(actual_tasks_indices)} 个任务, 保持并发数: {concurrency}"
+            )
+
+        futures = []
+        # 核心：整个轮次只创建一个线程池，设定最大并发数
+        with ThreadPoolExecutor(max_workers=concurrency) as ex:
+            # 瞬间把所有任务塞进队列，线程池会自动控制同时运行的数量
+            for idx in actual_tasks_indices:
+                futures.append(ex.submit(task, idx, rows[idx]))
+
+            # as_completed 会在【任何一个】窗口完成时立刻返回结果
+            # 并且线程池会自动从队列里拉取下一个任务去填补空缺窗口！
+            for fut in as_completed(futures):
+                if stop_event and stop_event.is_set():
+                    # 取消队列中还没开始的任务
+                    ex.shutdown(wait=False, cancel_futures=True)
                     break
-                remaining_needed = target_success_count - global_success_count
 
-            # Determine batch
-            batch_indices = round_tasks_indices[i : i + chunk_size]
-            # Cap batch size by remaining needed to avoid over-execution
-            current_batch_limit = min(len(batch_indices), remaining_needed)
-            actual_batch_indices = batch_indices[:current_batch_limit]
+                try:
+                    idx_res, ok, msg = fut.result()
 
-            if not actual_batch_indices:
-                break
+                    # 实时刷新 UI 进度
+                    if progress_cb and callable(progress_cb):
+                        total = len(rows)
+                        succ = sum(
+                            1
+                            for rr in rows
+                            if str(rr.get("status", "")).strip() == "good"
+                        )
+                        fail = sum(
+                            1
+                            for rr in rows
+                            if str(rr.get("status", "")).strip() == "fail"
+                        )
+                        progress_cb(total, succ, fail, rounds + 1, 0)
 
-            # Submit Batch
-            futures = []
-            if logger:
-                logger(f"Process Batch: {len(actual_batch_indices)} tasks")
-            with ThreadPoolExecutor(max_workers=len(actual_batch_indices)) as ex:
-                for idx in actual_batch_indices:
-                    futures.append(ex.submit(task, idx, rows[idx]))
-
-                for fut in as_completed(futures):
-                    try:
-                        idx_res, ok, msg = fut.result()
-                        # Log result
-
-                        if progress_cb and callable(progress_cb):
-                            total = len(rows)
-                            succ = sum(
-                                1
-                                for rr in rows
-                                if str(rr.get("status", "")).strip() == "good"
-                            )
-                            fail = sum(
-                                1
-                                for rr in rows
-                                if str(rr.get("status", "")).strip() == "fail"
-                            )
-                            progress_cb(total, succ, fail, rounds + 1, 0)
-
-                        with lock:
-                            if global_success_count >= target_success_count:
-                                if not stop_event.is_set():
-                                    stop_event.set()
-                                    if logger:
-                                        logger(
-                                            f"🛑 终止条件触发: 已达到目标注册数量 ({target_success_count})"
-                                        )
-                    except Exception:
-                        pass
-
-            if stop_event.is_set():
-                break
+                    # 实时检测是否达到目标
+                    with lock:
+                        if global_success_count >= target_success_count:
+                            if not stop_event.is_set():
+                                stop_event.set()
+                                if logger:
+                                    logger(
+                                        f"🛑 终止条件触发: 已达到目标 ({target_success_count})"
+                                    )
+                            ex.shutdown(wait=False, cancel_futures=True)
+                            break
+                except Exception:
+                    pass
+        # --------------------------------------------------------
 
         write_rows_csv(input_path, rows)
         rounds += 1
