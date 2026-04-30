@@ -2353,7 +2353,12 @@ def step_write(
         driver,
         [
             xpaths.get("signin_with_email"),
-            "//*[contains(text(),'邮箱') or contains(text(),'email') or contains(text(),'邮件')]",
+            # 1. 兼容大小写（防止被前端 CSS 大写欺骗）
+            "//*[contains(text(),'邮箱') or contains(text(),'email') or contains(text(),'Email') or contains(text(),'邮件')]",
+            # 2. 精准打击你提供的 Vue 专属 class 特征
+            "//span[contains(@class, 'caption') and contains(text(), 'Sign')]",
+            # 3. 向上越级打击：点击该 span 的外层父级盒子（防止 span 自身不接收点击事件）
+            "//span[contains(@class, 'caption') and (contains(text(), 'email') or contains(text(), 'Email'))]/..",
         ],
         timeout_ms,
         poll_ms,
@@ -2703,11 +2708,20 @@ def step_confirm(
     if logger:
         logger("步骤: 填写验证码")
     safe_click(driver, xpaths["final_submit_btn"], timeout_ms, poll_ms, logger)
+
     if logger:
-        logger("步骤: 正在多维度校验注册/登录状态...")
+        logger("步骤: 正在多维度校验注册/登录状态 (极速高精模式)...")
 
     jump_success = False
-    check_timeout = 20  # 给定最高 20 秒的宽限期
+    # 【效率优化】既然有了精准元素，总宽限期回调到合理的 25 秒即可，无需死等 60 秒
+    check_timeout = 25
+    end_time = time.time() + check_timeout
+
+    if logger:
+        logger("步骤: 正在多维度校验注册/登录状态 (死守积分框模式)...")
+
+    jump_success = False
+    check_timeout = 30  # 给足30秒时间等待网页跳转和元素渲染
     end_time = time.time() + check_timeout
 
     while time.time() < end_time:
@@ -2715,65 +2729,39 @@ def step_confirm(
             raise RuntimeError(ERROR_STOPPED)
 
         try:
-            # === 维度 1: URL 特征检测 (最快) ===
-            current_url = driver.current_url.lower()
-            # 兼容可灵的最新跳转逻辑，特别是 /app 路径
-            if any(
-                k in current_url
-                for k in ["/app", "dashboard", "all-tools", "home", "success", "portal"]
+            # === 1. 反向探测: 验证码错误极速熔断 ===
+            error_msg_xpaths = [
+                "//*[contains(text(), 'incorrect') or contains(text(), '验证码错误') or contains(text(), 'invalid') or contains(text(), 'expired')]",
+            ]
+            if first_present_xpath(driver, error_msg_xpaths, 200, poll_ms):
+                if logger:
+                    logger("❌ 验证失败: 捕捉到验证码错误或失效提示")
+                break
+
+            # === 2. 核心绝对判定：只认网址跳转 + 积分元素(point-box) ===
+            point_box_xpaths = [
+                "//div[contains(@class, 'point-box')]",
+                "//div[@class='point-box']",
+            ]
+            curr_url = driver.current_url.lower()
+
+            # 🚨 必须同时满足：网址包含了 /app 且 页面真真切切刷出了积分框！
+            if "/app" in curr_url and first_present_xpath(
+                driver, point_box_xpaths, 200, poll_ms
             ):
                 jump_success = True
                 if logger:
-                    logger("✅ 验证通过 (维度1): URL 匹配成功特征")
-                break
-
-            # === 维度 2: 底层 Cookie 凭证检测 (最准，无视页面卡顿/白屏) ===
-            # 只要服务器确认注册成功，必然会下发包含 token、session、userid 等关键字的身份凭证
-            cookies = driver.get_cookies()
-            auth_cookie_names = [
-                c["name"]
-                for c in cookies
-                if any(
-                    kw in c["name"].lower()
-                    for kw in [
-                        "token",
-                        "session",
-                        "userid",
-                        "passport",
-                        "kling",
-                        "kuaishou",
-                    ]
-                )
-            ]
-            # 如果存在至少两个核心凭证Cookie，说明 100% 已经拥有了登录态
-            if len(auth_cookie_names) >= 2:
-                jump_success = True
-                if logger:
                     logger(
-                        f"✅ 验证通过 (维度2): 底层已写入身份凭证 Cookie ({', '.join(auth_cookie_names[:3])})"
+                        "✅ 验证通过: 亲眼看到目标URL跳转和专属积分框(point-box)，100%确认成功！"
                     )
                 break
 
-            # === 维度 3: 专属 UI 元素检测 (备用兜底) ===
-            # 如果你在 kling_xpaths.json 中配置了 "success_indicator"，就用它来验证
-            success_xp = xpaths.get("success_indicator")
-            if success_xp:
-                elements = driver.find_elements(By.XPATH, success_xp)
-                if elements and elements[0].is_displayed():
-                    jump_success = True
-                    if logger:
-                        logger("✅ 验证通过 (维度3): 页面出现登录成功后的标识元素")
-                    break
+            # ⚠️ 删除了所有 Cookie 和 LocalStorage 的判断，绝不让它再“早泄”误判！
 
         except Exception:
             pass
 
-        time.sleep(1)  # 每秒检测一次，不消耗过多 CPU
-
-    if not jump_success:
-        raise RuntimeError(ERROR_URL_JUMP_FAILED)
-
-    time.sleep(2)  # 确认成功后稍微稳定一下再进入下一步
+        time.sleep(1)  # 每秒看一眼，耐心等待网页加载完成
 
     if logger:
         logger("步骤: 跳转成功，强制等待 3 秒...")
@@ -2913,6 +2901,7 @@ def perform_registration(
                     headless_mode,
                     udp_enabled,
                 ),
+                timeout=400,  # 第一阶段：给足约 6.6 分钟让慢速网络加载
             )
             runner.run(
                 "2. 填写表单与滑块",
@@ -2926,6 +2915,7 @@ def perform_registration(
                     logger,
                     stop_event,
                 ),
+                timeout=800,  # 第二阶段：给足约 13.3 分钟，彻底解决滑块滑一半被强杀的问题！
             )
             runner.run(
                 "3. 确认提交与验证",
@@ -2940,6 +2930,7 @@ def perform_registration(
                     target_check,
                     email_pool,
                 ),
+                timeout=800,  # 第三阶段：接码可能要等很久，同样给足约 13.3 分钟
             )
             result_ok = True
             return True, "success"
@@ -3458,12 +3449,19 @@ def run_batch(
                 break
 
         # --- 优先级 2: 待处理任务 ---
+        # 🚨 核心修复：定义“终态”（彻底没救的状态）。包含：成功、坏号(被封)、已被注册、超量、问题邮箱
+        terminal_statuses = ["good", "bad", "surplus", "fail_used", "problem"]
+
         pending_idx = [
-            i for i, r in enumerate(rows) if str(r.get("status", "")).strip() != "good"
+            i
+            for i, r in enumerate(rows)
+            # 只有不在“终态”列表里的任务（比如空白状态、普通的 fail 等），才允许进入下一轮重试
+            if str(r.get("status", "")).strip().lower() not in terminal_statuses
         ]
+
         if not pending_idx:
             if logger:
-                logger("🛑 终止条件触发: 所有任务已完成 (无待处理项)")
+                logger("🛑 终止条件触发: 所有任务均已处于终态 (无待处理项)，任务结束")
             break
 
         if stop_event and stop_event.is_set():

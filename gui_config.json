@@ -3,8 +3,8 @@
   "bit_url": "http://127.0.0.1:54345",
   "bit_secret": "",
   "platform_url": "https://kling.ai",
-  "concurrency": 4,
-  "timeout_ms": 50000,
+  "concurrency": 3,
+  "timeout_ms": 100000,
   "poll_ms": 500,
   "build_output": "dist",
   "ip_def_port": "47682",
@@ -13,7 +13,7 @@
   "ip_def_protocol": "socks5",
   "ip_config_path": "config/ip_pool.json",
   "udp_enabled": false,
-  "save_traffic": true,
+  "save_traffic": false,
   "email_mode": "IMAP模式",
   "target_reg_count": "10"
 }
