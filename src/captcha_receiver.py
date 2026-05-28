@@ -34,7 +34,6 @@
 版本: 1.0.0
 """
 
-from email.utils import parsedate_to_datetime  # 添加这一行用于解析邮件时间
 import datetime  # 新增这一行
 import email
 import functools
@@ -46,6 +45,7 @@ import time
 import uuid
 from email.header import decode_header
 from email.message import Message
+from email.utils import parsedate_to_datetime  # 添加这一行用于解析邮件时间
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import socks
@@ -94,13 +94,15 @@ MAX_SCAN_EMAILS: int = 10  # 扫描最新邮件数量
 
 # 验证码提取正则表达式 (严格匹配6位)
 CODE_REGEX_PATTERNS: List[str] = [
-    r"验证码[\s:：]*([\d]{6})",  
-    r"verification code[\s:：]*([\d]{6})",  
+    r"验证码[\s:：]*([\d]{6})",
+    r"verification code[\s:：]*([\d]{6})",
     r"code[\s:：]*([\d]{6})",
     r"\b(\d{6})\b",  # 通用6位数字
 ]
 CODE_REGEX_DEFAULT: str = r"\b\d{4,6}\b"
-MAX_SCAN_EMAILS: int = 20  # 建议把最大扫描数量从 10 改为 20，防止当天垃圾邮件太多顶掉验证码
+MAX_SCAN_EMAILS: int = (
+    20  # 建议把最大扫描数量从 10 改为 20，防止当天垃圾邮件太多顶掉验证码
+)
 # HTML 标签清理正则
 HTML_TAG_REGEX: str = r"<[^>]+>"
 
@@ -515,7 +517,27 @@ class MailExtractor:
 
             # 登录
             self._log(f"Logging in as {self.email_account}...")
-            typ, data = self.mail.login(self.email_account, self.password)
+
+            # --- 核心替换区：智能拦截带 ||| 的 Token，走 OAuth2 通道 ---
+            if "|||" in self.password:
+                client_id, refresh_token = self.password.split("|||", 1)
+                self._log("Detected OAuth2 format. Exchanging token...")
+
+                access_token = self._get_ms_access_token(client_id, refresh_token)
+                if not access_token:
+                    raise AuthenticationError(
+                        "Failed to get Access Token via Microsoft API."
+                    )
+
+                auth_string = (
+                    f"user={self.email_account}\x01auth=Bearer {access_token}\x01\x01"
+                )
+                typ, data = self.mail.authenticate(
+                    "XOAUTH2", lambda x: auth_string.encode("utf-8")
+                )
+            else:
+                # 兼容 163 等其他无需 OAuth2 的普通邮箱
+                typ, data = self.mail.login(self.email_account, self.password)
 
             if typ != "OK":
                 raise AuthenticationError(f"Login failed: {data}")
@@ -576,6 +598,32 @@ class MailExtractor:
                 level="warning",
             )
 
+    def _get_ms_access_token(self, client_id: str, refresh_token: str) -> Optional[str]:
+        """使用 Refresh Token 向微软请求最新的 Access Token (直连模式)"""
+        import requests
+
+        url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+        data = {
+            "client_id": client_id,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        }
+
+        try:
+            self._log(
+                "Requesting Access Token from Microsoft API (Direct connection)...",
+                level="debug",
+            )
+            # 强制不使用任何环境变量中的代理
+            session = requests.Session()
+            session.trust_env = False
+            res = session.post(url, data=data, timeout=15)
+            res.raise_for_status()
+            return res.json().get("access_token")
+        except Exception as e:
+            self._log(f"OAuth exchange failed: {e}", level="error")
+            return None
+
     @retry(
         max_retries=MAX_RETRIES,
         delay=RETRY_DELAY,
@@ -634,7 +682,7 @@ class MailExtractor:
             ...     if code:
             ...         print(f"验证码: {code}")
         """
-    
+
         try:
             # 确保连接
             if not self.is_connected or self.mail is None:
@@ -662,16 +710,20 @@ class MailExtractor:
             recent_ids = email_ids[-scan_count:]
             recent_ids.reverse()  # 最新的在前
 
-            self._log(f"Scanning last {len(recent_ids)} emails for KlingAI verification codes...")
+            self._log(
+                f"Scanning last {len(recent_ids)} emails for KlingAI verification codes..."
+            )
 
             # 遍历邮件提取验证码
             for i, eid in enumerate(recent_ids):
                 email_id_str = eid.decode() if isinstance(eid, bytes) else str(eid)
-                
+
                 try:
                     typ, msg_data = self.mail.fetch(eid, "(RFC822)")
                 except imaplib.IMAP4.error as e:
-                    self._log(f"Failed to fetch email {email_id_str}: {e}", level="warning")
+                    self._log(
+                        f"Failed to fetch email {email_id_str}: {e}", level="warning"
+                    )
                     continue
 
                 if typ != "OK":
@@ -681,11 +733,16 @@ class MailExtractor:
                 if code:
                     return code
 
-            self._log("No valid KlingAI verification code found in today's recent emails.")
+            self._log(
+                "No valid KlingAI verification code found in today's recent emails."
+            )
             return None
 
         except (ConnectionError, AuthenticationError, IMAPCommandError, Exception) as e:
-            self._log(f"Error getting verification code: {type(e).__name__}: {e}", level="error")
+            self._log(
+                f"Error getting verification code: {type(e).__name__}: {e}",
+                level="error",
+            )
             self.is_connected = False
             return None
 
@@ -703,7 +760,7 @@ class MailExtractor:
                 continue
 
             # ================= 核心过滤逻辑 =================
-            
+
             # 1. 检查主题
             subject = self._decode_str(msg.get("Subject", ""))
             if "KlingAI Account Verification" not in subject:
@@ -721,12 +778,20 @@ class MailExtractor:
                 email_date = parsedate_to_datetime(date_str).astimezone()
                 today = datetime.datetime.now().astimezone().date()
                 if email_date.date() != today:
-                    self._log(f"Skipped: Email matched but date ({email_date.date()}) is not today.", level="debug")
+                    self._log(
+                        f"Skipped: Email matched but date ({email_date.date()}) is not today.",
+                        level="debug",
+                    )
                     continue
             except Exception as e:
-                self._log(f"Failed to parse date: {date_str}, skipping date check.", level="warning")
+                self._log(
+                    f"Failed to parse date: {date_str}, skipping date check.",
+                    level="warning",
+                )
 
-            self._log(f"Matched KlingAI Email: {subject} | Time: {date_str}", level="info")
+            self._log(
+                f"Matched KlingAI Email: {subject} | Time: {date_str}", level="info"
+            )
 
             # ================= 提取验证码逻辑 =================
 
