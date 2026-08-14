@@ -506,7 +506,8 @@ class EmailPool:
         """
         解析单行邮箱数据（暴力破解多余引号与全格式兼容版）。
         """
-        line = line.strip()
+        # 终极过滤：不仅去除首尾空格，还要强行剔除隐形的 BOM 头 (\ufeff)
+        line = line.strip().lstrip("\ufeff")
         if not line:
             return None
 

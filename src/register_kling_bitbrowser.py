@@ -60,7 +60,7 @@ SHORT_TIMEOUT_MS = 8000
 MAX_SLIDER_RETRIES = 8
 MAX_REGISTRATION_ATTEMPTS = 3
 MAX_CODE_RETRIES = 2
-MAX_BROWSER_DELETE_RETRIES = 3
+MAX_BROWSER_DELETE_RETRIES = 5
 SAFE_CLICK_RETRIES = 2
 
 # Resource limits
@@ -308,9 +308,26 @@ class BitBrowserClient:
         self.base_url = base_url.rstrip("/")
         self.secret = secret
         self.session = requests.Session()
-        # Optimize connection pool
+
+        # ============================================================
+        # BitBrowser API 全局限流
+        #
+        # 注册任务可以 8 并发，但 BitBrowser 本地 API 不允许 8 个线程
+        # 同时 create/open/close/delete。
+        #
+        # 最多允许 2 个 API 请求同时执行。
+        # 并且两个 API 请求的启动时间至少间隔 0.6 秒。
+        # ============================================================
+        self._api_semaphore = threading.BoundedSemaphore(2)
+        self._api_rate_lock = threading.Lock()
+        self._last_api_request_time = 0.0
+        self._api_min_interval = 0.6
+
+        # HTTP连接池不用开太大，真正的并发由上面的 semaphore 控制
         adapter = requests.adapters.HTTPAdapter(
-            pool_connections=20, pool_maxsize=20, max_retries=3
+            pool_connections=10,
+            pool_maxsize=10,
+            max_retries=0,
         )
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
@@ -326,57 +343,191 @@ class BitBrowserClient:
         method: str,
         endpoint: str,
         data: Optional[Dict[str, Any]] = None,
-        timeout: int = 60,  # 增加默认超时到60秒
-        max_retries: int = 3,  # 默认重试3次
+        timeout: int = 60,
+        max_retries: int = 5,
     ) -> requests.Response:
-        """增强版请求方法，支持自动重试和更好的错误处理。"""
+        """
+        BitBrowser API统一请求入口。
+
+        功能：
+        1. 最多2个BitBrowser API请求同时执行
+        2. API请求启动间隔至少0.6秒
+        3. HTTP 429自动退避重试
+        4. 连接失败/超时自动重试
+        5. 不影响Selenium/邮箱接码等其他并发
+        """
+
         url = f"{self.base_url}{endpoint}"
         last_exception = None
 
-        for attempt in range(max_retries):
-            try:
-                t0 = time.time()
-                if method.upper() == "POST":
-                    r = self.session.post(
-                        url,
-                        headers=self._headers(),
-                        data=json.dumps(data) if data else None,
-                        timeout=timeout,
-                    )
-                else:
-                    r = self.session.get(url, headers=self._headers(), timeout=timeout)
+        max_retries = max(1, int(max_retries))
 
-                # Log slow requests
-                elapsed = time.time() - t0
-                if elapsed > 1.0:
+        for attempt in range(1, max_retries + 1):
+
+            # ========================================================
+            # 429重试的每一轮，都重新进入API限流队列
+            # ========================================================
+            with self._api_semaphore:
+
+                # ----------------------------------------------------
+                # 控制请求启动频率
+                # 即使8个线程同时来到这里，也会依次间隔0.6秒发送
+                # ----------------------------------------------------
+                with self._api_rate_lock:
+                    now = time.monotonic()
+
+                    elapsed_since_last = now - self._last_api_request_time
+                    wait_for_rate = self._api_min_interval - elapsed_since_last
+
+                    if wait_for_rate > 0:
+                        time.sleep(wait_for_rate)
+
+                    self._last_api_request_time = time.monotonic()
+
+                try:
+                    t0 = time.time()
+
+                    if method.upper() == "POST":
+                        r = self.session.post(
+                            url,
+                            headers=self._headers(),
+                            data=json.dumps(data) if data is not None else None,
+                            timeout=timeout,
+                        )
+                    else:
+                        r = self.session.get(
+                            url,
+                            headers=self._headers(),
+                            timeout=timeout,
+                        )
+
+                    elapsed = time.time() - t0
+
+                    if elapsed > 1.0:
+                        print(
+                            f"Slow BitBrowser API: "
+                            f"{method} {endpoint} took {elapsed:.2f}s"
+                        )
+
+                    # =================================================
+                    # HTTP 429：不要直接杀掉注册任务
+                    # =================================================
+                    if r.status_code == 429:
+                        last_exception = requests.exceptions.HTTPError(
+                            f"429 Too Many Requests: {method} {url}",
+                            response=r,
+                        )
+
+                        if attempt >= max_retries:
+                            print(
+                                f"BitBrowser API 429，"
+                                f"已达到最大重试次数 "
+                                f"{attempt}/{max_retries}: {endpoint}"
+                            )
+                            raise last_exception
+
+                        # 优先读取服务器 Retry-After
+                        retry_after = None
+                        try:
+                            retry_after_value = r.headers.get("Retry-After")
+                            if retry_after_value:
+                                retry_after = float(retry_after_value)
+                        except Exception:
+                            retry_after = None
+
+                        # 没有 Retry-After 时：
+                        # 第1次 2秒
+                        # 第2次 4秒
+                        # 第3次 6秒
+                        # 第4次 8秒
+                        wait_time = (
+                            retry_after
+                            if retry_after is not None
+                            else min(attempt * 2, 10)
+                        )
+
+                        print(
+                            f"⚠️ BitBrowser API触发429: {endpoint} | "
+                            f"尝试 {attempt}/{max_retries}，"
+                            f"{wait_time:.1f}秒后重试..."
+                        )
+
+                    else:
+                        # 其他 HTTP 错误正常抛出
+                        if r.status_code == 405:
+                            print(
+                                f"HTTP 405 Method Not Allowed: "
+                                f"{method} {url}"
+                            )
+
+                        r.raise_for_status()
+                        return r
+
+                except requests.exceptions.HTTPError as e:
+                    # 429已经在上面处理
+                    if (
+                        getattr(e, "response", None) is not None
+                        and e.response.status_code == 429
+                    ):
+                        last_exception = e
+
+                        if attempt >= max_retries:
+                            raise
+
+                        # wait_time 会在 semaphore 外面计算
+                        wait_time = min(attempt * 2, 10)
+
+                    else:
+                        # 400 / 401 / 403 / 404 / 405 等错误
+                        # 不应该反复轰API
+                        if (
+                            getattr(e, "response", None) is not None
+                            and e.response.status_code == 405
+                        ):
+                            print(
+                                f"HTTP 405 Error Details: "
+                                f"{method} {url} - {e.response.text}"
+                            )
+
+                        raise
+
+                except (
+                    requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout,
+                ) as e:
+                    last_exception = e
+
+                    if attempt >= max_retries:
+                        raise
+
+                    wait_time = min(2 ** (attempt - 1), 8)
+
                     print(
-                        f"Slow BitBrowser API: {method} {endpoint} took {elapsed:.2f}s"
+                        f"BitBrowser API连接失败 "
+                        f"{attempt}/{max_retries}: "
+                        f"{method} {endpoint} | {e}"
                     )
 
-                if r.status_code == 405:
-                    print(f"HTTP 405 Method Not Allowed: {method} {url}")
-                r.raise_for_status()
-                return r
-            except requests.exceptions.HTTPError as e:
-                if e.response.status_code == 405:
-                    print(f"HTTP 405 Error Details: {method} {url} - {e.response.text}")
-                raise e
-            except (
-                requests.exceptions.ConnectionError,
-                requests.exceptions.Timeout,
-            ) as e:
-                last_exception = e
-                wait_time = 2**attempt  # 指数退避: 1s, 2s, 4s
-                print(f"BitBrowser API连接失败(尝试 {attempt + 1}/{max_retries}): {e}")
-                if attempt < max_retries - 1:
-                    print(f"等待 {wait_time} 秒后重试...")
-                    time.sleep(wait_time)
-                continue
-            except requests.exceptions.RequestException:
-                raise
+                except requests.exceptions.RequestException:
+                    raise
 
-        # 所有重试都失败
-        raise last_exception if last_exception else RuntimeError(f"API请求失败: {url}")
+            # ========================================================
+            # 非常重要：
+            # 睡眠放在 semaphore 外面。
+            #
+            # 否则一个429线程睡8秒，会一直霸占API名额。
+            # ========================================================
+            if attempt < max_retries:
+                print(
+                    f"等待 {wait_time:.1f} 秒后重试 "
+                    f"BitBrowser API: {endpoint}"
+                )
+                time.sleep(wait_time)
+
+        if last_exception:
+            raise last_exception
+
+        raise RuntimeError(f"BitBrowser API请求失败: {url}")
 
     def update_browser(
         self,
@@ -416,7 +567,13 @@ class BitBrowserClient:
             payload["cmdArgs"] = cmd_args
         if proxy:
             payload.update(proxy)
-        r = self._request("POST", "/browser/update", payload, timeout=30)
+        r = self._request(
+            "POST",
+            "/browser/update",
+            payload,
+            timeout=30,
+            max_retries=5,
+        )
         data = r.json()
         d = data.get("data")
         bid = None
@@ -467,7 +624,13 @@ class BitBrowserClient:
             payload["cmdArgs"] = cmd_args
         if proxy:
             payload.update(proxy)
-        r = self._request("POST", "/browser/create", payload, timeout=30)
+        r = self._request(
+            "POST",
+            "/browser/create",
+            payload,
+            timeout=30,
+            max_retries=5,
+        )
         data = r.json()
         d = data.get("data")
         bid = None
@@ -481,25 +644,93 @@ class BitBrowserClient:
             raise RuntimeError(f"create_browser failed: {data}")
         return bid
 
-    def open_browser(self, browser_id: str) -> Dict[str, Any]:
-        payload = {"id": browser_id}
-        r = self._request("POST", "/browser/open", payload, timeout=60)
+    def open_browser(
+        self,
+        browser_id: str,
+        headless_mode: bool = False,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "id": browser_id,
+        }
+
+        # ============================================================
+        # BitBrowser 官方真正无头模式
+        # ============================================================
+        if headless_mode:
+            payload.update(
+                {
+                    "args": ["--headless"],
+                    "queue": True,
+                    "ignoreDefaultUrls": True,
+                }
+            )
+
+        # 保留之前增加的 API 限流 / 429 自动重试
+        r = self._request(
+            "POST",
+            "/browser/open",
+            payload,
+            timeout=60,
+            max_retries=5,
+        )
+
         data = r.json()
         d = data.get("data")
+
         if isinstance(d, dict):
             return d
-        return {}
+
+        raise RuntimeError(
+            f"open_browser 返回异常: browser_id={browser_id}, response={data}"
+        )
 
     def close_browser(self, browser_id: str) -> None:
+        """
+        关闭浏览器窗口。
+        失败必须向上抛异常，不能静默 pass。
+        """
+        if not browser_id:
+            return
+
+        r = self._request(
+            "POST",
+            "/browser/close",
+            {"id": browser_id},
+            timeout=15,
+            max_retries=1,
+        )
+
+        # HTTP 200 但 API 业务层失败时，也视为失败
         try:
-            self._request("POST", "/browser/close", {"id": browser_id}, timeout=10)
-        except (requests.exceptions.RequestException, RuntimeError):
+            data = r.json()
+            if isinstance(data, dict) and data.get("success") is False:
+                raise RuntimeError(f"close_browser failed: {data}")
+        except ValueError:
+            # 有些版本接口成功时可能没有 JSON，HTTP 2xx 就算成功
             pass
 
     def delete_browser(self, browser_id: str) -> None:
+        """
+        删除浏览器 Profile。
+        删除失败必须抛异常，让外层真正执行重试。
+        """
+        if not browser_id:
+            return
+
+        r = self._request(
+            "POST",
+            "/browser/delete",
+            {"id": browser_id},
+            timeout=30,
+            max_retries=1,
+        )
+
+        # HTTP 200 但 API 返回业务失败，也不能假装删除成功
         try:
-            self._request("POST", "/browser/delete", {"id": browser_id}, timeout=30)
-        except (requests.exceptions.RequestException, RuntimeError):
+            data = r.json()
+            if isinstance(data, dict) and data.get("success") is False:
+                raise RuntimeError(f"delete_browser failed: {data}")
+        except ValueError:
             pass
 
     def detail_browser(self, browser_id: str) -> Dict[str, Any]:
@@ -1855,25 +2086,139 @@ def extract_verification_code_unified(
 ) -> Optional[str]:
     if logger:
         logger(f"Unified Captcha: Start (Email: {email_addr}) Mode: IMAP")
-    start_time = time.time()
-    max_retries = 3
 
-    main_handle = driver.current_window_handle
+    try:
+        main_handle = driver.current_window_handle
+    except Exception:
+        main_handle = None
+
     use_imap_proxy = os.getenv("DISABLE_IMAP_PROXY", "false").lower() != "true"
     imap_proxy = proxy_config if use_imap_proxy else None
 
+    def _mark_problem(reason: str) -> None:
+        """把当前邮箱立即标记为问题邮箱。"""
+        if not email_pool:
+            return
+
+        reason = str(reason or "未知错误")
+        reason = reason.replace("\n", " ").replace("\r", " ")
+        reason = reason[:180]
+
+        try:
+            if hasattr(email_pool, "update_email_status"):
+                email_pool.update_email_status(email_addr, "problem", reason=reason)
+            elif hasattr(email_pool, "update_status"):
+                email_pool.update_status(email_addr, "problem", reason=reason)
+        except Exception as e:
+            if logger:
+                logger(f"Unified Captcha: 标记问题邮箱失败: {e}")
+
+    def _is_fatal_oauth_error(err_text: str) -> bool:
+        """判断是否为 OAuth/token 致命错误。"""
+        s = (err_text or "").lower()
+        fatal_keywords = [
+            "failed to get access token",
+            "oauth exchange failed",
+            "authenticationerror",
+            "invalid_grant",
+            "invalid_client",
+            "bad request",
+            "400 client error",
+            "401 client error",
+            "403 client error",
+        ]
+        return any(k in s for k in fatal_keywords)
+
+    def _precheck_oauth_token() -> None:
+        """
+        Outlook OAuth 邮箱先快速检测 token。
+        如果微软直接返回 400/401/403，说明 token 已废，立即 problem，不再等 400 秒。
+        """
+        if "|||" not in str(password or ""):
+            return
+
+        try:
+            client_id, refresh_token = str(password).split("|||", 1)
+            client_id = client_id.strip()
+            refresh_token = refresh_token.strip()
+        except Exception:
+            _mark_problem("OAuth格式错误: 缺少 client_id 或 refresh_token")
+            raise RuntimeError("oauth_token_failed")
+
+        if not client_id or not refresh_token:
+            _mark_problem("OAuth格式错误: client_id 或 refresh_token 为空")
+            raise RuntimeError("oauth_token_failed")
+
+        try:
+            import requests
+
+            url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+            data = {
+                "client_id": client_id,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            }
+
+            session = requests.Session()
+            session.trust_env = False
+
+            if logger:
+                logger(f"Unified Captcha: OAuth预检 Access Token: {email_addr}")
+
+            res = session.post(url, data=data, timeout=15)
+
+            if res.status_code in (400, 401, 403):
+                body = ""
+                try:
+                    body = res.text[:300]
+                except Exception:
+                    pass
+
+                reason = f"OAuth token失效: HTTP {res.status_code} {body}"
+                if logger:
+                    logger(f"Unified Captcha: ❌ {reason}")
+
+                _mark_problem(reason)
+                raise RuntimeError("oauth_token_failed")
+
+            # 其他非 2xx 先不立刻判死刑，交给后面的 IMAP 流程处理
+            if not res.ok and logger:
+                logger(
+                    f"Unified Captcha: OAuth预检非成功状态 HTTP {res.status_code}，继续走正常接码流程"
+                )
+
+        except RuntimeError:
+            raise
+        except Exception as e:
+            # 网络抖动/微软接口临时异常，不直接标 problem，继续走原接码流程
+            if logger:
+                logger(f"Unified Captcha: OAuth预检异常，继续正常流程: {e}")
+
+    # 关键修复：OAuth 坏号先预检，坏号立即退出，不再占窗口等 400 秒
+    _precheck_oauth_token()
+
     extractor = None
+
     try:
         extractor = MailExtractor(
-            email_addr, password, proxy_config=imap_proxy, logger=logger
+            email_addr,
+            password,
+            proxy_config=imap_proxy,
+            logger=logger,
         )
     except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+
+        if _is_fatal_oauth_error(err):
+            if logger:
+                logger(f"Unified Captcha: ❌ OAuth初始化失败，立即标记问题邮箱: {err}")
+            _mark_problem(f"OAuth初始化失败: {err}")
+            raise RuntimeError("oauth_token_failed")
+
         if logger:
             logger(f"Unified Captcha: ❌ 初始化邮箱连接失败: {e}")
-        if email_pool:
-            email_pool.update_status(
-                email_addr, "problem", reason=f"IMAP登录失败: {str(e)}"
-            )
+
+        _mark_problem(f"IMAP登录失败: {str(e)}")
         return None
 
     try:
@@ -1883,34 +2228,57 @@ def extract_verification_code_unified(
         t_poll_start = time.time()
         code = None
 
-        # 只进行一个死循环监听，直到达到设定的总超时时间 (timeout)
         while time.time() - t_poll_start < timeout:
             if stop_event and stop_event.is_set():
                 return None
+
             try:
                 if not extractor:
                     extractor = MailExtractor(
-                        email_addr, password, proxy_config=imap_proxy, logger=logger
+                        email_addr,
+                        password,
+                        proxy_config=imap_proxy,
+                        logger=logger,
                     )
+
                 code = extractor.get_latest_verification_code()
 
                 if (
                     code
                     and code not in ["未匹配到验证码", "未找到邮件"]
-                    and not code.startswith("错误:")
+                    and not str(code).startswith("错误:")
                 ):
                     if logger:
                         logger(f"Unified Captcha: ✅ 成功获取验证码: {code}")
+
+                    try:
+                        if main_handle:
+                            driver.switch_to.window(main_handle)
+                    except Exception:
+                        pass
+
                     return code
+
             except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+
+                if _is_fatal_oauth_error(err):
+                    if logger:
+                        logger(f"Unified Captcha: ❌ OAuth失效，立即标记问题邮箱并跳过: {err}")
+
+                    _mark_problem(f"OAuth失效: {err}")
+                    raise RuntimeError("oauth_token_failed")
+
+                if logger:
+                    logger(f"Unified Captcha: 邮箱读取异常，继续重试: {err}")
+
                 extractor = None
 
-            # 每隔 3 秒去邮箱拉取一次
             time.sleep(3)
 
-        # 如果跳出了 while 循环，说明超过了 timeout 秒还没拿到，直接返回失败
         if logger:
             logger(f"Unified Captcha: ❌ {timeout} 秒内未收到验证码，放弃当前邮箱。")
+
         return None
 
     finally:
@@ -1919,7 +2287,6 @@ def extract_verification_code_unified(
                 extractor.close()
             except Exception:
                 pass
-    return None
 
 
 # =============================================================================
@@ -2039,7 +2406,15 @@ def step_verify(
     if logger:
         logger(f"profile_id {browser_id}")
 
-    open_data = client.open_browser(browser_id)
+    if headless_mode:
+        if logger:
+            logger("🚀 已启用 BitBrowser 官方无头模式 (--headless)")
+
+    open_data = client.open_browser(
+        browser_id,
+        headless_mode=headless_mode,
+    )
+
     ctx["open_data"] = open_data
 
     # Try to get PID for cleanup
@@ -2109,15 +2484,63 @@ def step_verify(
     except Exception:
         pass
 
-    # Headless Mode
-    if headless_mode:
-        try:
-            driver.set_window_position(-3000, 0)
-        except Exception:
-            try:
-                driver.minimize_window()
-            except Exception:
-                pass
+    ctx["driver"] = driver
+    ctx["t_attached"] = time.time()
+    ctx["gate_state"] = "attached"
+
+    # ============================================================
+    # 浏览器渲染尺寸
+    #
+    # 真无头模式使用桌面分辨率，避免 Kling 进入手机/窄屏响应式布局。
+    # 普通模式继续保持原来的较小窗口，避免占用桌面。
+    # ============================================================
+    try:
+        if headless_mode:
+            target_width = 1440
+            target_height = 900
+        else:
+            target_width = 800
+            target_height = 650
+
+        driver.set_window_size(target_width, target_height)
+
+        # 读取浏览器真正生效的尺寸
+        window_size = driver.get_window_size()
+
+        viewport_info = driver.execute_script(
+            """
+            return {
+                innerWidth: window.innerWidth,
+                innerHeight: window.innerHeight,
+                outerWidth: window.outerWidth,
+                outerHeight: window.outerHeight,
+                devicePixelRatio: window.devicePixelRatio,
+                screenWidth: screen.width,
+                screenHeight: screen.height
+            };
+            """
+        )
+
+        if logger:
+            logger(
+                f"浏览器尺寸: "
+                f"headless={headless_mode}, "
+                f"window={window_size}, "
+                f"viewport={viewport_info}"
+            )
+
+    except Exception as e:
+        if logger:
+            logger(f"⚠️ 设置/读取浏览器尺寸失败: {e}")
+
+    if logger:
+        logger("步骤: 打开平台网址")
+
+    if not check_connectivity(
+        driver, platform_url, logger, max_wait=45, udp_enabled=udp_enabled
+    ):
+        take_screenshot(driver, f"{window_name}_connectivity_failed.png", logger)
+        raise RuntimeError(ERROR_PROXY_CONNECTIVITY_FAILED)
 
     if logger:
         logger("步骤: 打开平台网址")
@@ -2329,22 +2752,366 @@ def step_write(
 
     if logger:
         logger("步骤: 已切换到新标签")
-    wait_page_ready(driver, 20)
 
+    wait_page_ready(driver, 20)
     time.sleep(1)
+
+    # ============================================================
+    # Sign In 前页面诊断
+    #
+    # 用来判断无头模式失败到底属于：
+    # 1. 切错标签
+    # 2. 页面还没加载
+    # 3. 响应式布局导致 Sign In 被隐藏
+    # 4. Sign In 文案/DOM发生变化
+    # 5. Sign In 位于 iframe
+    # ============================================================
+    try:
+        current_url = driver.current_url
+    except Exception as e:
+        current_url = f"<读取失败: {e}>"
+
+    try:
+        current_title = driver.title
+    except Exception as e:
+        current_title = f"<读取失败: {e}>"
+
+    try:
+        current_handle = driver.current_window_handle
+    except Exception:
+        current_handle = "unknown"
+
+    try:
+        all_handles = driver.window_handles
+    except Exception:
+        all_handles = []
+
+    try:
+        current_size = driver.get_window_size()
+    except Exception:
+        current_size = {}
+
+    try:
+        viewport_info = driver.execute_script(
+            """
+            return {
+                innerWidth: window.innerWidth,
+                innerHeight: window.innerHeight,
+                outerWidth: window.outerWidth,
+                outerHeight: window.outerHeight,
+                devicePixelRatio: window.devicePixelRatio
+            };
+            """
+        )
+    except Exception:
+        viewport_info = {}
+
+    try:
+        iframe_count = len(driver.find_elements(By.TAG_NAME, "iframe"))
+    except Exception:
+        iframe_count = -1
+
     if logger:
-        logger("步骤: 点击 Sign In")
-    if not safe_click_any(
+        logger(
+            f"🔍 SignIn诊断: "
+            f"URL={current_url} | "
+            f"Title={current_title} | "
+            f"Handle={current_handle} | "
+            f"Handles={len(all_handles)} | "
+            f"Window={current_size} | "
+            f"Viewport={viewport_info} | "
+            f"Iframes={iframe_count}"
+        )
+
+    # ------------------------------------------------------------
+    # 检查页面里到底有没有包含 Sign In / 登录 的元素，
+    # 包括隐藏元素。
+    # ------------------------------------------------------------
+    try:
+        signin_candidates = driver.find_elements(
+            By.XPATH,
+            "//*[contains(normalize-space(.),'Sign In') or "
+            "contains(normalize-space(.),'登录')]"
+        )
+
+        visible_count = 0
+
+        if logger:
+            logger(
+                f"🔍 SignIn元素扫描: 总匹配={len(signin_candidates)}"
+            )
+
+        # 最多输出前10个，避免日志爆炸
+        for index, el in enumerate(signin_candidates[:10], start=1):
+            try:
+                displayed = el.is_displayed()
+
+                if displayed:
+                    visible_count += 1
+
+                tag = el.tag_name
+                text = (el.text or "").strip().replace("\n", " ")
+                cls = el.get_attribute("class") or ""
+                rect = el.rect
+
+                if logger:
+                    logger(
+                        f"🔍 SignIn候选#{index}: "
+                        f"tag={tag}, "
+                        f"displayed={displayed}, "
+                        f"text={text[:120]!r}, "
+                        f"class={cls[:160]!r}, "
+                        f"rect={rect}"
+                    )
+
+            except Exception as e:
+                if logger:
+                    logger(
+                        f"🔍 SignIn候选#{index}: 读取元素信息失败: {e}"
+                    )
+
+        if logger:
+            logger(
+                f"🔍 SignIn元素扫描结果: "
+                f"总数={len(signin_candidates)}, "
+                f"可见数={visible_count}"
+            )
+
+    except Exception as e:
+        if logger:
+            logger(f"⚠️ SignIn元素扫描失败: {e}")
+
+
+    if logger:
+        logger("步骤: 点击 Sign In / One-Click Sign In")
+
+    # ========================================================
+    # 兼容普通模式 + BitBrowser Headless 模式
+    #
+    # 普通页面可能显示：
+    #   Sign In
+    #
+    # 无头页面当前实际显示：
+    #   One-Click Sign In
+    #
+    # 使用 normalize-space(.) 而不是 text()
+    # 可以兼容文字被 span 等子元素包裹的情况。
+    # ========================================================
+    signin_xpaths = [
+        # Headless 当前页面实际按钮
+        "//button[contains(normalize-space(.), 'One-Click Sign In')]",
+
+        # role=button 的情况
+        "//*[@role='button' and contains(normalize-space(.), 'One-Click Sign In')]",
+
+        # 普通模式 Sign In
+        "//button[contains(normalize-space(.), 'Sign In')]",
+
+        # 其他可点击元素
+        "//*[@role='button' and contains(normalize-space(.), 'Sign In')]",
+
+        # 原配置保留兼容
+        xpaths.get("signin_btn"),
+
+        # 中文页面兼容
+        "//button[contains(normalize-space(.), '登录')]",
+        "//*[@role='button' and contains(normalize-space(.), '登录')]",
+    ]
+
+    signin_clicked = safe_click_any(
         driver,
-        [
-            xpaths.get("signin_btn"),
-            "//*[contains(text(),'Sign In') or contains(text(),'登录')]",
-        ],
+        signin_xpaths,
         timeout_ms,
         poll_ms,
         logger,
         retries=2,
-    ):
+    )
+
+    # ========================================================
+    # XPath没有点击成功时，使用JS进行第二层兜底
+    # ========================================================
+    if not signin_clicked:
+        if logger:
+            logger("⚠️ XPath未点击到 Sign In，开始JS兜底查找...")
+
+        try:
+            signin_clicked = bool(
+                driver.execute_script(
+                    """
+                    const selectors = [
+                        'button',
+                        '[role="button"]',
+                        'a'
+                    ];
+
+                    const elements = Array.from(
+                        document.querySelectorAll(selectors.join(','))
+                    );
+
+                    for (const el of elements) {
+                        const text = (
+                            el.innerText ||
+                            el.textContent ||
+                            ''
+                        )
+                        .replace(/\\s+/g, ' ')
+                        .trim();
+
+                        const isSignin =
+                            text.includes('One-Click Sign In') ||
+                            text === 'Sign In' ||
+                            text.includes('Sign In') ||
+                            text.includes('登录');
+
+                        if (!isSignin) {
+                            continue;
+                        }
+
+                        const rect = el.getBoundingClientRect();
+                        const style = window.getComputedStyle(el);
+
+                        const visible =
+                            rect.width > 0 &&
+                            rect.height > 0 &&
+                            style.display !== 'none' &&
+                            style.visibility !== 'hidden' &&
+                            style.opacity !== '0';
+
+                        if (!visible) {
+                            continue;
+                        }
+
+                        try {
+                            el.scrollIntoView({
+                                block: 'center',
+                                inline: 'center'
+                            });
+                        } catch (e) {}
+
+                        el.click();
+                        return true;
+                    }
+
+                    return false;
+                    """
+                )
+            )
+
+            if signin_clicked:
+                if logger:
+                    logger("✅ JS成功点击 Sign In / One-Click Sign In")
+            else:
+                if logger:
+                    logger("⚠️ JS也没有找到可点击的 Sign In")
+
+        except Exception as e:
+            if logger:
+                logger(f"⚠️ JS点击 Sign In 异常: {e}")
+
+    # ========================================================
+    # 还是失败 → 保存完整现场
+    # ========================================================
+    if not signin_clicked:
+
+        try:
+            current_url = driver.current_url
+        except Exception:
+            current_url = "unknown"
+
+        try:
+            current_title = driver.title
+        except Exception:
+            current_title = "unknown"
+
+        try:
+            current_size = driver.get_window_size()
+        except Exception:
+            current_size = {}
+
+        try:
+            viewport_info = driver.execute_script(
+                """
+                return {
+                    innerWidth: window.innerWidth,
+                    innerHeight: window.innerHeight,
+                    scrollWidth: document.documentElement.scrollWidth,
+                    scrollHeight: document.documentElement.scrollHeight,
+                    readyState: document.readyState
+                };
+                """
+            )
+        except Exception:
+            viewport_info = {}
+
+        # ====================================================
+        # 再输出当前页面所有可能的登录按钮
+        # 以后即使Kling再次改文案，也能直接从日志看出来
+        # ====================================================
+        try:
+            signin_debug = driver.execute_script(
+                """
+                const els = Array.from(
+                    document.querySelectorAll(
+                        'button, [role="button"], a'
+                    )
+                );
+
+                return els.slice(0, 100).map((el, index) => {
+                    const rect = el.getBoundingClientRect();
+
+                    return {
+                        index: index,
+                        tag: el.tagName,
+                        text: (
+                            el.innerText ||
+                            el.textContent ||
+                            ''
+                        ).replace(/\\s+/g, ' ').trim().slice(0, 150),
+                        width: Math.round(rect.width),
+                        height: Math.round(rect.height),
+                        displayed:
+                            rect.width > 0 &&
+                            rect.height > 0
+                    };
+                }).filter(
+                    item =>
+                        item.text.includes('Sign') ||
+                        item.text.includes('登录')
+                );
+                """
+            )
+
+        except Exception as e:
+            signin_debug = f"读取失败: {e}"
+
+        if logger:
+            logger(
+                f"❌ Sign In 点击失败最终现场: "
+                f"URL={current_url} | "
+                f"Title={current_title} | "
+                f"Window={current_size} | "
+                f"Viewport={viewport_info} | "
+                f"LoginElements={signin_debug}"
+            )
+
+        # 每个邮箱单独保存截图，8并发不会互相覆盖
+        try:
+            safe_email_name = (
+                email.replace("@", "_at_")
+                .replace(".", "_")
+                .replace("/", "_")
+            )
+
+            take_screenshot(
+                driver,
+                f"signin_failed_{safe_email_name}.png",
+                logger,
+            )
+
+        except Exception as e:
+            if logger:
+                logger(f"SignIn失败截图异常: {e}")
+
         raise RuntimeError(ERROR_SIGNIN_CLICK_FAILED)
 
     if logger:
@@ -2962,36 +3729,24 @@ def perform_registration(
             if logger:
                 logger(f"正在清理资源: {browser_id}")
 
-            elapsed = time.time() - t_attached if t_attached else 0
-            early_failure = (not result_ok) and (
-                gate_state in ("attached", "pre_open_more_tools", "tab_switched")
-            )
-            is_stopped = stop_event and stop_event.is_set()
-            hold_close = (
-                (not result_ok)
-                and (not is_stopped)
-                and (
-                    (elapsed < (keep_open_on_failure_ms / 1000.0))
-                    or (allow_hold_on_early_failure and early_failure)
-                )
-            )
+            # ============================================================
+            # 强制资源清理
+            # 规则：
+            # 1. 无论成功失败，先退出 Selenium / 关闭浏览器进程
+            # 2. 注册失败时，必须删除 BitBrowser Profile
+            # 3. 删除失败必须真正重试，绝不假装删除成功
+            # ============================================================
 
-            if hold_close and logger:
-                if allow_hold_on_early_failure and early_failure:
-                    logger("因早期失败，保持窗口并等待后续重试")
-                else:
-                    logger(
-                        f"因失败且未达到最小保持时间({keep_open_on_failure_ms}ms)，暂不关闭窗口"
-                    )
-
-            try:
-                if driver and not hold_close:
+            # ---------- 1. 退出 Selenium ----------
+            if driver:
+                try:
                     try:
                         driver.execute_script(
                             "try{document.activeElement && document.activeElement.blur();}catch(e){}"
                         )
                     except Exception:
                         pass
+
                     try:
                         driver.get("about:blank")
                     except Exception:
@@ -3003,45 +3758,97 @@ def perform_registration(
                         except Exception:
                             pass
 
-                    t_quit = threading.Thread(target=_quit_driver)
+                    t_quit = threading.Thread(
+                        target=_quit_driver,
+                        daemon=True,
+                    )
                     t_quit.start()
-                    t_quit.join(timeout=3.0)
-            except Exception as e:
-                if logger:
-                    logger(f"driver.quit error: {e}")
+                    t_quit.join(timeout=5.0)
 
-            try:
-                if browser_id and not hold_close:
+                    if t_quit.is_alive() and logger:
+                        logger("⚠️ driver.quit 超时，将继续强制清理浏览器进程")
+
+                except Exception as e:
+                    if logger:
+                        logger(f"driver.quit error: {e}")
+
+            # ---------- 2. 关闭 BitBrowser ----------
+            if browser_id:
+                try:
+                    client.close_browser(browser_id)
+                    if logger:
+                        logger(f"已关闭浏览器窗口: {browser_id}")
+                except Exception as e:
+                    if logger:
+                        logger(f"⚠️ 关闭浏览器窗口失败: {browser_id} | {e}")
+
+                # 给 BitBrowser 一点时间释放进程
+                time.sleep(1.0)
+
+                # 如果 PID 还活着，强制杀掉
+                pid = ctx.get("browser_pid")
+                if pid:
                     try:
-                        client.close_browser(browser_id)
-                    except Exception:
-                        pass
-
-                    # Force kill if PID known and process still exists
-                    pid = ctx.get("browser_pid")
-                    if pid:
-                        # Give it a moment to close gracefully
-                        time.sleep(1.0)
                         if psutil.pid_exists(pid):
                             if logger:
                                 logger(
                                     f"检测到浏览器进程 PID={pid} 仍存在，执行强制清理"
                                 )
                             kill_process_tree(pid, logger)
-            except Exception:
-                pass
+                    except Exception as e:
+                        if logger:
+                            logger(f"强制清理 PID={pid} 失败: {e}")
 
+            # ---------- 3. 注册失败必须删除 Profile ----------
             if browser_id and not result_ok:
                 if logger:
                     logger(f"任务失败，正在删除窗口: {browser_id}")
-                for _ in range(MAX_BROWSER_DELETE_RETRIES):
+
+                delete_success = False
+                last_delete_error = None
+
+                for attempt in range(1, MAX_BROWSER_DELETE_RETRIES + 1):
                     try:
                         client.delete_browser(browser_id)
+
+                        delete_success = True
+
                         if logger:
-                            logger(f"已删除失败窗口: {browser_id}")
+                            logger(
+                                f"✅ 已删除失败窗口: {browser_id} "
+                                f"(第 {attempt}/{MAX_BROWSER_DELETE_RETRIES} 次)"
+                            )
+
                         break
-                    except Exception:
-                        time.sleep(2.0)
+
+                    except Exception as e:
+                        last_delete_error = e
+
+                        if logger:
+                            logger(
+                                f"⚠️ 删除失败窗口失败 "
+                                f"{attempt}/{MAX_BROWSER_DELETE_RETRIES}: "
+                                f"{browser_id} | {e}"
+                            )
+
+                        if attempt < MAX_BROWSER_DELETE_RETRIES:
+                            # 429 时不要马上继续轰 BitBrowser API
+                            # 依次等待 3、6、9、12 秒
+                            wait_sec = attempt * 3
+
+                            if logger:
+                                logger(
+                                    f"等待 {wait_sec} 秒后重新删除窗口..."
+                                )
+
+                            time.sleep(wait_sec)
+
+                if not delete_success:
+                    if logger:
+                        logger(
+                            f"❌ 失败窗口最终删除失败: {browser_id} | "
+                            f"{last_delete_error}"
+                        )
 
 
 # =============================================================================

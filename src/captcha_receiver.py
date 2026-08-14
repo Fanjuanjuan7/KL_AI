@@ -744,6 +744,12 @@ class MailExtractor:
                 level="error",
             )
             self.is_connected = False
+
+            # OAuth / Access Token 失效，不能继续等验证码，直接向上抛出
+            err = f"{type(e).__name__}: {e}"
+            if isinstance(e, AuthenticationError) or "Failed to get Access Token" in err:
+                raise
+
             return None
 
     def _parse_and_extract(self, msg_data: List[Tuple[bytes, bytes]]) -> Optional[str]:

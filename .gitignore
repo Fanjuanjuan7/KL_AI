@@ -26,6 +26,9 @@ ip_pool.json
 *.csv
 !kl-mail.csv
 
+# Project memory / agent data (本地记忆，不入库)
+.workbuddy/
+
 # Backups and Artifacts
 backups/
 test_artifacts/

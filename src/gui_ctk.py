@@ -8,7 +8,7 @@ KL-账号批量注册工具 - GUI 主模块
 - 邮箱池管理：管理邮箱账号，支持 IMAP 和 心蓝 两种模式
 
 作者: KL Team
-版本: 1.0.0
+版本: 3.0.9
 """
 
 # Standard library imports
