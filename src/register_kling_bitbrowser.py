@@ -64,8 +64,8 @@ MAX_BROWSER_DELETE_RETRIES = 5
 SAFE_CLICK_RETRIES = 2
 
 # Resource limits
-DEFAULT_MAX_CPU_PERCENT = 30
-DEFAULT_MAX_MEM_MB = 200
+DEFAULT_MAX_CPU_PERCENT = 90   # 整机 CPU 使用率超过此值(%)才视为繁忙（原 30 过低，正常负载即误报）
+DEFAULT_MAX_MEM_MB = 300        # 整机“可用内存”低于此值(MB)才视为繁忙（注意：是可用内存，非本进程内存）
 
 # Slider pass cache timeout (seconds)
 SLIDER_CACHE_TIMEOUT_SEC = 300
@@ -166,21 +166,27 @@ class StepRunner:
         self.max_mem = max_mem
 
     def _check_resources(self) -> None:
-        """Check system resources and wait if they are too high."""
+        """检查整机资源，仅在机器确实快撑不住时才短暂停顿。
+
+        历史坑：旧实现用 psutil.Process(os.getpid()).memory_info().rss（本 Python 进程
+        自身内存）与 200MB 上限比较。带 GUI + 多个浏览器时本进程内存天然 > 200MB，
+        于是几乎每次都误报“资源繁忙”并白白等待，看起来像卡死/报错。
+        现改为测量【整机可用内存】，阈值也放宽到合理范围，正常负载下不会再误报。
+        """
         try:
-            for _ in range(5):
-                cpu = psutil.cpu_percent(interval=None)  # Non-blocking first check
-                if cpu == 0.0:  # First call often returns 0
-                    cpu = psutil.cpu_percent(interval=0.1)
+            for _ in range(3):
+                cpu = psutil.cpu_percent(interval=0.1)
 
-                mem = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
+                # 整机可用内存（MB），而非本进程 RSS
+                mem_avail = psutil.virtual_memory().available / 1024 / 1024
 
-                if cpu < self.max_cpu and mem < self.max_mem:
+                # 可用内存充足 且 CPU 未打满 → 直接放行，不等待
+                if mem_avail > self.max_mem and cpu < self.max_cpu:
                     return
 
                 if self.logger:
                     self.logger(
-                        f"资源繁忙 (CPU={cpu:.1f}%, Mem={mem:.1f}MB)，等待释放..."
+                        f"资源繁忙 (CPU={cpu:.1f}%, 可用内存={mem_avail:.1f}MB)，等待释放..."
                     )
                 time.sleep(1)
         except (psutil.Error, OSError):
