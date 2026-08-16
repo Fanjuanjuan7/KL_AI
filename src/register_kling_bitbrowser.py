@@ -630,13 +630,26 @@ class BitBrowserClient:
             payload["cmdArgs"] = cmd_args
         if proxy:
             payload.update(proxy)
-        r = self._request(
-            "POST",
-            "/browser/create",
-            payload,
-            timeout=30,
-            max_retries=5,
-        )
+        try:
+            r = self._request(
+                "POST",
+                "/browser/create",
+                payload,
+                timeout=30,
+                max_retries=5,
+            )
+        except requests.exceptions.HTTPError as e:
+            # 404 = 本地API根本没有「创建窗口」这个路由，几乎都是
+            # 比特浏览器客户端/账号侧的问题，翻译成人话，避免误以为是程序bug
+            resp = getattr(e, "response", None)
+            if resp is not None and resp.status_code == 404:
+                raise RuntimeError(
+                    "比特浏览器「创建窗口」接口返回404：本地API未提供该接口。"
+                    "请排查：①比特浏览器客户端是否已登录账号；"
+                    "②设置→高级→「本地API接口」是否开启；"
+                    "③客户端版本是否支持API创建窗口（可先重启客户端再试）。"
+                ) from e
+            raise
         data = r.json()
         d = data.get("data")
         bid = None
@@ -3950,6 +3963,46 @@ def run_batch(
         except requests.exceptions.RequestException as e:
             return False, f"请求异常: {e}"
 
+    def _probe_create(url: str, timeout: int = 10) -> tuple[bool, str]:
+        """探测「创建窗口」接口是否可用（不会残留窗口）。
+
+        仅 health-check 阶段调用。历史上多次出现 list/open 正常、
+        唯有 create 404 的"假正常"：实为比特浏览器客户端/账号侧问题。
+        这里提前探一次，把故障挡在正式注册之前，并给出可读的排查指引。
+        """
+        try:
+            h = client._headers()
+            r = requests.post(
+                f"{url.rstrip('/')}/browser/create",
+                headers=h,
+                data=json.dumps({"name": "__health_probe__"}),
+                timeout=timeout,
+            )
+            if r.status_code == 404:
+                return False, (
+                    "「创建窗口」接口返回404（路由不存在）—— 通常是比特浏览器客户端"
+                    "未登录账号 / 本地API未完整开启 / 客户端版本不支持API创建"
+                )
+            if r.status_code == 200:
+                # 路由存在，可能真创建了测试窗口，立刻清理避免残留
+                try:
+                    d = r.json().get("data")
+                    bid = d.get("id") if isinstance(d, dict) else None
+                    if bid:
+                        requests.post(
+                            f"{url.rstrip('/')}/browser/delete",
+                            headers=h,
+                            data=json.dumps({"id": bid}),
+                            timeout=timeout,
+                        )
+                except Exception:
+                    pass
+                return True, "「创建窗口」接口可用"
+            # 400/405 等其它状态码都说明路由存在，只是参数问题
+            return True, f"「创建窗口」接口存在(HTTP {r.status_code})"
+        except requests.exceptions.RequestException as e:
+            return False, f"「创建窗口」接口探测异常: {e}"
+
     if logger:
         logger("开始进行比特浏览器接口连通性检查 (health-check)")
 
@@ -3992,6 +4045,24 @@ def run_batch(
     else:
         if logger:
             logger(f"✅ 比特浏览器接口连接正常: {client.base_url}")
+
+    # ============================================================
+    # 额外探测「创建窗口」接口 —— 根治"假正常"
+    # list/open 正常但 create 404 时，注册阶段才会暴露，且会白白消耗
+    # 邮箱与IP。这里提前探一次，create 不可用时直接给出排查指引并退出。
+    # ============================================================
+    create_ok, create_msg = _probe_create(client.base_url, timeout=10)
+    if not create_ok:
+        if logger:
+            logger("=" * 50)
+            logger("❌ 比特浏览器「创建窗口」接口不可用")
+            logger(create_msg)
+            logger("排查步骤：")
+            logger("1. 比特浏览器客户端是否已登录账号")
+            logger("2. 设置→高级→「本地API接口」是否开启")
+            logger("3. 重启比特浏览器客户端后重新运行")
+            logger("=" * 50)
+        return
 
     lock = threading.Lock()
     global_success_count = 0
