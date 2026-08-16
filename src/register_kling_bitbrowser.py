@@ -633,21 +633,21 @@ class BitBrowserClient:
         try:
             r = self._request(
                 "POST",
-                "/browser/create",
+                "/browser/update",
                 payload,
                 timeout=30,
                 max_retries=5,
             )
         except requests.exceptions.HTTPError as e:
-            # 404 = 本地API根本没有「创建窗口」这个路由，几乎都是
-            # 比特浏览器客户端/账号侧的问题，翻译成人话，避免误以为是程序bug
+            # 404 = 本地API没有「创建窗口」(/browser/update) 这个路由，
+            # 几乎都是比特浏览器客户端/账号侧的问题，翻译成人话，避免误以为是程序bug
             resp = getattr(e, "response", None)
             if resp is not None and resp.status_code == 404:
                 raise RuntimeError(
-                    "比特浏览器「创建窗口」接口返回404：本地API未提供该接口。"
-                    "请排查：①比特浏览器客户端是否已登录账号；"
+                    "比特浏览器「创建窗口」接口(/browser/update)返回404：本地API不可用。"
+                    "请排查：①比特浏览器客户端是否已启动并登录账号；"
                     "②设置→高级→「本地API接口」是否开启；"
-                    "③客户端版本是否支持API创建窗口（可先重启客户端再试）。"
+                    "③客户端版本是否完整（可重启或重装客户端后重试）。"
                 ) from e
             raise
         data = r.json()
@@ -3973,9 +3973,10 @@ def run_batch(
         try:
             h = client._headers()
             r = requests.post(
-                f"{url.rstrip('/')}/browser/create",
+                f"{url.rstrip('/')}/browser/update",
                 headers=h,
-                data=json.dumps({"name": "__health_probe__"}),
+                # 故意缺代理方式，触发业务报错而非真正创建窗口，仅用于探测路由是否存在
+                data=json.dumps({"name": "__health_probe__", "browserFingerPrint": {}}),
                 timeout=timeout,
             )
             if r.status_code == 404:
