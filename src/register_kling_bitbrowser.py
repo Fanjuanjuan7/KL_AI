@@ -658,6 +658,11 @@ class BitBrowserClient:
                 raise RuntimeError(
                     "比特浏览器账号已掉线（Login out）：请在比特浏览器客户端重新登录账号后再跑注册。"
                 )
+            if "窗口数" in _msg or "可用窗口" in _msg or "超过" in _msg:
+                raise RuntimeError(
+                    "比特浏览器账号的窗口配额已满（" + _msg + "）："
+                    "请在客户端删除不再使用的旧窗口释放配额，或升级账号购买更多窗口数。"
+                )
         d = data.get("data")
         bid = None
         if isinstance(d, dict):
