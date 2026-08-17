@@ -651,6 +651,13 @@ class BitBrowserClient:
                 ) from e
             raise
         data = r.json()
+        # 识别比特浏览器账号登录态失效（Login out），给出可读中文
+        if isinstance(data, dict) and data.get("success") is False:
+            _msg = str(data.get("msg", "") or "")
+            if "login out" in _msg.lower() or "登录" in _msg:
+                raise RuntimeError(
+                    "比特浏览器账号已掉线（Login out）：请在比特浏览器客户端重新登录账号后再跑注册。"
+                )
         d = data.get("data")
         bid = None
         if isinstance(d, dict):
@@ -3945,6 +3952,10 @@ def run_batch(
             if r.status_code == 200:
                 try:
                     data = r.json()
+                    if isinstance(data, dict) and data.get("success") is False:
+                        _m = str(data.get("msg", "") or "")
+                        if "login out" in _m.lower():
+                            return False, "比特浏览器账号已掉线(Login out)，请在客户端重新登录"
                     if data.get("success") or "data" in data:
                         return True, f"API正常响应"
                     return True, "API响应(可能无数据)"
