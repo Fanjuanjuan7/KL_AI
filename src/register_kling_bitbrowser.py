@@ -2602,8 +2602,10 @@ def step_verify(
             xpaths.get("language_menu"),
             xpaths.get("language_menu_alt"),
             xpaths.get("signin_btn"),
+            xpaths.get("signin_with_email"),
             xpaths.get("Creative Studio"),
             "//*[contains(text(), 'Sign In') or contains(text(), '登录')]",
+            "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'continue with email')]",
         ]
 
         # 使用你 UI 上配置的最大超时时间 (timeout_ms) 进行智能探测
@@ -2862,6 +2864,7 @@ def step_write(
         signin_candidates = driver.find_elements(
             By.XPATH,
             "//*[contains(normalize-space(.),'Sign In') or "
+            "contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'),'continue with email') or "
             "contains(normalize-space(.),'登录')]"
         )
 
@@ -2914,7 +2917,7 @@ def step_write(
 
 
     if logger:
-        logger("步骤: 点击 Sign In / One-Click Sign In")
+        logger("步骤: 点击 Sign In / One-Click Sign In / Continue with email")
 
     # ========================================================
     # 兼容普通模式 + BitBrowser Headless 模式
@@ -2940,6 +2943,11 @@ def step_write(
 
         # 其他可点击元素
         "//*[@role='button' and contains(normalize-space(.), 'Sign In')]",
+
+        # 新版登录弹窗：直接通过邮箱继续
+        xpaths.get("signin_with_email"),
+        "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'continue with email')]",
+        "//div[contains(concat(' ', normalize-space(@class), ' '), ' sign-in-button ')]",
 
         # 原配置保留兼容
         xpaths.get("signin_btn"),
@@ -2992,6 +3000,7 @@ def step_write(
                             text.includes('One-Click Sign In') ||
                             text === 'Sign In' ||
                             text.includes('Sign In') ||
+                            text.toLowerCase().includes('continue with email') ||
                             text.includes('登录');
 
                         if (!isSignin) {
@@ -3030,14 +3039,14 @@ def step_write(
 
             if signin_clicked:
                 if logger:
-                    logger("✅ JS成功点击 Sign In / One-Click Sign In")
+                    logger("✅ JS成功点击 Sign In / One-Click Sign In / Continue with email")
             else:
                 if logger:
-                    logger("⚠️ JS也没有找到可点击的 Sign In")
+                    logger("⚠️ JS也没有找到可点击的 Sign In / Continue with email")
 
         except Exception as e:
             if logger:
-                logger(f"⚠️ JS点击 Sign In 异常: {e}")
+                logger(f"⚠️ JS点击 Sign In / Continue with email 异常: {e}")
 
     # ========================================================
     # 还是失败 → 保存完整现场
@@ -3107,6 +3116,7 @@ def step_write(
                 }).filter(
                     item =>
                         item.text.includes('Sign') ||
+                        item.text.toLowerCase().includes('continue with email') ||
                         item.text.includes('登录')
                 );
                 """
@@ -3117,7 +3127,7 @@ def step_write(
 
         if logger:
             logger(
-                f"❌ Sign In 点击失败最终现场: "
+                f"❌ Sign In / Continue with email 点击失败最终现场: "
                 f"URL={current_url} | "
                 f"Title={current_title} | "
                 f"Window={current_size} | "
@@ -3147,7 +3157,19 @@ def step_write(
 
     if logger:
         logger("步骤: 选择邮箱登录")
-    if not safe_click_any(
+    email_input_present = first_present_xpath(
+        driver,
+        [
+            xpaths.get("Enter Email Address"),
+            "//*[@placeholder][contains(@placeholder,'邮箱') or contains(@placeholder,'Email')]",
+        ],
+        3000,
+        poll_ms,
+    )
+    if email_input_present:
+        if logger:
+            logger("✅ 已直接进入邮箱输入页，跳过『选择邮箱登录』")
+    elif not safe_click_any(
         driver,
         [
             xpaths.get("signin_with_email"),

@@ -3,7 +3,7 @@
   "english_option": "//*[contains(@class, 'el-dropdown-menu__item') and contains(., 'English')]",
   "Creative Studio": "//*[text()='Creative Studio']",
   "More Tools": "//*[text()='More Tools']",
-  "signin_btn": "//button[contains(normalize-space(.), 'One-Click Sign In') or normalize-space(.)='Sign In']",
+  "signin_btn": "//button[contains(normalize-space(.), 'One-Click Sign In') or normalize-space(.)='Sign In' or contains(normalize-space(.), 'Continue with email')]",
   "signin_with_email": "//div[contains(concat(' ', normalize-space(@class), ' '), ' sign-in-button ')][.//*[local-name()='use' and contains(@*[local-name()='href'], 'icon-sign-in-email')] or .//span[contains(concat(' ', normalize-space(@class), ' '), ' caption ') and (contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'email') or contains(normalize-space(.), '邮箱'))]]",
   "Sign up for free": "//*[text()='Sign up for free']",
   "Enter Email Address": "//*[@placeholder='Enter Email Address']",
