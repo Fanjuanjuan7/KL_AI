@@ -1283,6 +1283,303 @@ def safe_click_any(
     return safe_click(driver, xp, timeout_ms, poll_ms, logger, retries)
 
 
+# =============================================================================
+# 点击并验证（Click & Verify）
+#
+# 背景：safe_click 的最终兜底是 JS 的 arguments[0].click()。它有两个盲区：
+#   1) JS click 不会转移焦点 —— 输入框不触发 blur。若前端把表单校验
+#      （如密码一致性、强度）挂在 blur/change 上，此刻按钮仍处于
+#      "校验未通过"状态，click 处理器直接 return，点了等于白点；
+#      但它仍返回 True，调用方误以为成功，页面就此卡住。
+#      手动点一下之所以有效，正是真实鼠标点击会让输入框先失焦。
+#   2) 元素被浮层遮挡时，WebDriver 原生 click 抛异常，同样退化成 JS click。
+# 因此这里补上：点击前主动失焦、点击后验证真的生效、无效则换方式重试。
+# =============================================================================
+
+
+def _blur_active_element(driver: webdriver.Remote) -> bool:
+    """让当前焦点元素失焦，触发 change/blur，促使前端完成表单校验。"""
+    try:
+        return bool(
+            driver.execute_script(
+                """
+                try {
+                  var el = document.activeElement;
+                  if (!el || el === document.body) return false;
+                  try { el.dispatchEvent(new Event('change', {bubbles:true})); } catch(e) {}
+                  try { el.dispatchEvent(new Event('blur', {bubbles:true})); } catch(e) {}
+                  try { if (el.blur) el.blur(); } catch(e) {}
+                  return true;
+                } catch(e) { return false; }
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
+def _coverage_blocker(driver: webdriver.Remote, el) -> str:
+    """返回遮挡元素中心的元素描述；未被遮挡返回空串。"""
+    try:
+        r = driver.execute_script(
+            """
+            var el = arguments[0];
+            if (!el) return 'no_element';
+            var r = el.getBoundingClientRect();
+            if (r.width <= 0 || r.height <= 0) return 'zero_size';
+            var x = r.left + r.width / 2, y = r.top + r.height / 2;
+            if (x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight)
+                return 'out_of_viewport';
+            var top = document.elementFromPoint(x, y);
+            if (!top) return 'no_element_at_point';
+            if (top === el || el.contains(top) || top.contains(el)) return '';
+            var cls = '', id = '';
+            try { cls = String(top.className || ''); } catch (e) {}
+            try { id = String(top.id || ''); } catch (e) {}
+            return (top.tagName || '?') + (id ? '#' + id : '') + (cls ? '.' + cls.slice(0, 60) : '');
+            """,
+            el,
+        )
+        return str(r or "")
+    except Exception:
+        return ""
+
+
+def _js_full_pointer_click(driver: webdriver.Remote, el) -> bool:
+    """派发完整鼠标/指针事件序列（pointerdown→mousedown→pointerup→mouseup→click）。
+
+    比裸的 el.click() 覆盖更广：部分组件用 pointerdown/mousedown 处理点击，
+    只发单个 click 事件不会被响应。
+    """
+    try:
+        return bool(
+            driver.execute_script(
+                """
+                var el = arguments[0];
+                try {
+                  var r = el.getBoundingClientRect();
+                  var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+                  var base = {bubbles:true, cancelable:true, composed:true,
+                              clientX:cx, clientY:cy, screenX:cx, screenY:cy,
+                              button:0, view:window};
+                  function fire(type, extra) {
+                    try {
+                      var o = Object.assign({}, base, extra || {});
+                      var ev = (type.indexOf('pointer') === 0 && typeof PointerEvent === 'function')
+                        ? new PointerEvent(type, o) : new MouseEvent(type, o);
+                      el.dispatchEvent(ev);
+                    } catch (e) {}
+                  }
+                  fire('pointerdown', {buttons:1, pointerId:1, pointerType:'mouse', isPrimary:true});
+                  fire('mousedown',  {buttons:1, detail:1});
+                  fire('pointerup',  {buttons:0, pointerId:1, pointerType:'mouse', isPrimary:true});
+                  fire('mouseup',    {buttons:0, detail:1});
+                  fire('click',      {buttons:0, detail:1});
+                  return true;
+                } catch (e) { return false; }
+                """,
+                el,
+            )
+        )
+    except Exception:
+        return False
+
+
+def _wait_until(
+    pred: Callable[[], bool],
+    timeout_ms: int,
+    poll_ms: int,
+    stop_event: Optional[threading.Event] = None,
+) -> bool:
+    """轮询直到 pred 为真或超时。"""
+    end = time.time() + max(0.2, timeout_ms / 1000.0)
+    interval = max(0.15, poll_ms / 1000.0)
+    while True:
+        if stop_event and stop_event.is_set():
+            return False
+        try:
+            if pred():
+                return True
+        except Exception:
+            pass
+        if time.time() >= end:
+            return False
+        time.sleep(interval)
+
+
+def next_step_advanced_now(
+    driver: webdriver.Remote, xpaths: Dict[str, str]
+) -> bool:
+    """单次快速探测：点「Next Step」之后页面是否真的进入了下一步。
+
+    判据（任一命中即算已生效）：
+      · 滑块容器 / 滑块 iframe 出现（正常路径）
+      · 验证码输入框出现（已到接码页）
+      · 服务端明确反馈（邮箱已注册等）—— 说明点击确实被处理了
+    每次探测前先切回顶层文档，避免残留在 iframe 上下文里找不到元素。
+    """
+    xps = [
+        xpaths.get("slider_container"),
+        xpaths.get("slider_iframe"),
+        xpaths.get("code_url_element"),
+        "//iframe[contains(@src, 'captcha') or contains(@src, 'verify') or contains(@src, 'challenge')]",
+        "//*[contains(text(), 'Human Verification') or contains(text(), '人机验证') or contains(text(), '安全验证')]",
+        "//input[@autocomplete='one-time-code']",
+        "//input[contains(@placeholder, 'verification') or contains(@placeholder, 'Verification') or contains(@placeholder, '验证码')]",
+        "//*[contains(text(), 'already registered') or contains(text(), 'already used') or contains(text(), 'account exists')]",
+        "//*[contains(text(), '已注册') or contains(text(), '已被使用')]",
+    ]
+    try:
+        driver.switch_to.default_content()
+    except Exception:
+        pass
+
+    for xp in xps:
+        if not xp:
+            continue
+        try:
+            for el in driver.find_elements(By.XPATH, xp):
+                try:
+                    if el.is_displayed():
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return False
+
+
+def safe_click_verified(
+    driver: webdriver.Remote,
+    xpaths: List[Optional[str]],
+    timeout_ms: int,
+    poll_ms: int,
+    verify: Callable[[], bool],
+    logger: Optional[Callable[[str], None]] = None,
+    label: str = "目标按钮",
+    verify_timeout_ms: int = 6000,
+    max_rounds: int = 3,
+    stop_event: Optional[threading.Event] = None,
+    pre_blur: bool = True,
+) -> bool:
+    """点击按钮并【验证真的生效】，无效则换一种点击方式重试。
+
+    与 safe_click_any 的差异：
+      1) 点击前主动让输入框失焦，触发前端表单校验，避免"按钮未校验→点击被忽略"；
+      2) 点完立刻用 verify 回调确认效果，而不是发出去就算成功；
+      3) 每轮换一种点击方式，从最真实的鼠标事件逐步降级；
+      4) 全失败时打印页面按钮现场（含 disabled 标记）便于排查。
+    """
+    xp = first_present_xpath(driver, xpaths, timeout_ms, poll_ms)
+    if not xp:
+        if logger:
+            logger(f"{label}: 未找到可点击元素")
+        return False
+
+    # 已经处于点击后的状态，无需再点
+    if _wait_until(verify, min(1200, verify_timeout_ms), poll_ms, stop_event):
+        if logger:
+            logger(f"{label}: 检测到已生效，跳过点击")
+        return True
+
+    strategies = ("actionchains", "native", "pointer_seq", "js_naive")
+
+    for rnd in range(max(1, max_rounds)):
+        if stop_event and stop_event.is_set():
+            return False
+
+        el = None
+        try:
+            for cand in driver.find_elements(By.XPATH, xp):
+                try:
+                    if cand.is_displayed():
+                        el = cand
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            el = None
+        if el is None:
+            if logger:
+                logger(f"{label}: 第 {rnd + 1} 轮元素已不在页面")
+            break
+
+        # 1) 主动失焦：催促前端完成表单校验，再给一个 tick
+        if pre_blur and _blur_active_element(driver):
+            time.sleep(max(0.25, poll_ms / 1000.0))
+
+        # 2) 诊断：是否禁用 / 被遮挡
+        disabled = False
+        try:
+            disabled = not el.is_enabled()
+        except Exception:
+            pass
+        blocked = _coverage_blocker(driver, el)
+        if logger and (disabled or blocked):
+            logger(
+                f"{label}: 诊断 禁用={disabled} 遮挡={'无' if not blocked else blocked}"
+            )
+
+        try:
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center'});", el
+            )
+        except Exception:
+            pass
+
+        strategy = strategies[rnd % len(strategies)]
+        clicked = False
+        try:
+            if strategy == "actionchains":
+                ActionChains(driver).move_to_element(el).pause(0.1).click().perform()
+                clicked = True
+            elif strategy == "native":
+                el.click()
+                clicked = True
+            elif strategy == "pointer_seq":
+                clicked = _js_full_pointer_click(driver, el)
+            else:
+                clicked = bool(driver.execute_script("arguments[0].click();", el))
+        except Exception as e:
+            if logger:
+                logger(f"{label}: {strategy} 点击抛异常: {e}")
+            clicked = False
+
+        if logger:
+            logger(
+                f"{label}: 第 {rnd + 1}/{max_rounds} 轮用 {strategy} 点击 (已发出={clicked})"
+            )
+
+        # 3) 点击后验证
+        if _wait_until(verify, verify_timeout_ms, poll_ms, stop_event):
+            if logger:
+                logger(f"{label}: ✅ 已生效（{strategy}）")
+            return True
+
+        if logger:
+            logger(f"{label}: ⚠️ 点击后页面无变化，换方式重试")
+
+    # 4) 全失败：打印现场
+    if logger:
+        try:
+            diag = driver.execute_script(
+                """
+                var out = [];
+                var b = document.querySelectorAll('button');
+                for (var i = 0; i < b.length && out.length < 12; i++) {
+                  var t = (b[i].innerText || '').trim().replace(/\\s+/g, ' ');
+                  if (!t) continue;
+                  out.push(t.slice(0, 28) + (b[i].disabled ? '[disabled]' : ''));
+                }
+                return out.join(' | ');
+                """
+            )
+            logger(f"{label}: ❌ 多次点击均无效，页面按钮现场: {diag}")
+        except Exception:
+            pass
+    return False
+
+
 def js_click_xpath(driver: webdriver.Remote, xpath: str) -> bool:
     """Click an element using JavaScript execution."""
     try:
@@ -3378,18 +3675,34 @@ def step_write(
     ):
         raise RuntimeError(ERROR_CONFIRM_INPUT_FAILED)
 
+    # 关键：主动让确认密码框失焦，促使前端跑完表单校验（如两次密码一致性）。
+    # 不失焦时按钮可能仍被判定为"未校验完成"，点击会被静默忽略。
+    _blur_active_element(driver)
+    time.sleep(0.3)
+
     if logger:
         logger("步骤: 点击下一步")
-    if not safe_click_any(
+    # 说明：这里必须"点击 + 验证 + 重试"。
+    # 三处输入几乎同一秒完成，若后端把校验挂在 blur 上，按钮此刻仍是
+    # 未校验状态；而 JS click 不会让输入框失焦，点击直接被忽略，
+    # 表现为"卡在这一步，手动点一下才走"。详见 safe_click_verified 注释。
+    if not safe_click_verified(
         driver,
         [
             xpaths.get("next_btn"),
-            "//*[contains(text(),'下一步') or contains(text(),'Next')]",
+            "//button[contains(normalize-space(.), 'Next Step')]",
+            "//button[contains(normalize-space(.), 'Next')]",
+            "//*[@role='button' and contains(normalize-space(.), 'Next')]",
+            "//*[contains(text(),'下一步')]",
         ],
         timeout_ms,
         poll_ms,
-        logger,
-        retries=2,
+        verify=lambda: next_step_advanced_now(driver, xpaths),
+        logger=logger,
+        label="下一步(Next Step)",
+        verify_timeout_ms=6000,
+        max_rounds=3,
+        stop_event=stop_event,
     ):
         raise RuntimeError(ERROR_NEXT_CLICK_FAILED)
 
