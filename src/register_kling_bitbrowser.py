@@ -2104,6 +2104,97 @@ def log_response_bodies(
         pass
 
 
+def precheck_outlook_oauth(
+    email_addr: str,
+    password: str,
+    logger: Optional[Callable[[str], None]] = None,
+    email_pool: Optional[Any] = None,
+) -> bool:
+    """
+    注册开跑前快速预检 Outlook OAuth token（不依赖浏览器）。
+
+    微软对批量注册的邮箱常返回 AADSTS70000
+    (account found as compromised)，这类号接码必然失败。
+    如果不提前拦，单个坏号要白跑：开浏览器窗口 + 填表 + 过滑块
+    (实测 23~35 秒) + 占用 IP 名额，最后才在接码阶段失败。
+
+    返回 True = token 可用或非 OAuth 邮箱，放行；False = 已作废，应跳过本任务。
+    """
+    # 非 OAuth 邮箱（普通密码/授权码）无需预检
+    if "|||" not in str(password or ""):
+        return True
+
+    def _mark(reason: str) -> None:
+        if not email_pool:
+            return
+        reason = str(reason or "未知错误").replace("\n", " ").replace("\r", " ")[:180]
+        try:
+            if hasattr(email_pool, "update_email_status"):
+                email_pool.update_email_status(email_addr, "problem", reason=reason)
+            elif hasattr(email_pool, "update_status"):
+                email_pool.update_status(email_addr, "problem", reason=reason)
+        except Exception as e:
+            if logger:
+                logger(f"预检标记问题邮箱失败: {e}")
+
+    try:
+        client_id, refresh_token = str(password).split("|||", 1)
+        client_id = client_id.strip()
+        refresh_token = refresh_token.strip()
+    except Exception:
+        _mark("OAuth格式错误: 缺少 client_id 或 refresh_token")
+        if logger:
+            logger(f"🚫 邮箱预检失败(格式错误)，跳过不浪费窗口: {email_addr}")
+        return False
+
+    if not client_id or not refresh_token:
+        _mark("OAuth格式错误: client_id 或 refresh_token 为空")
+        if logger:
+            logger(f"🚫 邮箱预检失败(空值)，跳过不浪费窗口: {email_addr}")
+        return False
+
+    try:
+        import requests
+
+        session = requests.Session()
+        session.trust_env = False
+
+        res = session.post(
+            "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+            data={
+                "client_id": client_id,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            },
+            timeout=15,
+        )
+
+        if res.status_code in (400, 401, 403):
+            body = ""
+            try:
+                body = res.text[:300]
+            except Exception:
+                pass
+
+            if "compromised" in body.lower():
+                reason = "微软判定账号已泄露(AADSTS70000)，token永久作废"
+            else:
+                reason = f"OAuth token失效(预检): HTTP {res.status_code} {body}"
+
+            _mark(reason)
+            if logger:
+                logger(f"🚫 邮箱预检失败，跳过不浪费窗口/IP: {email_addr} -> {reason[:150]}")
+            return False
+
+        return True
+
+    except Exception as e:
+        # 网络抖动/微软接口临时异常不判死刑，交给后面的接码流程处理
+        if logger:
+            logger(f"⚠️ 邮箱预检网络异常，放行: {email_addr} -> {e}")
+        return True
+
+
 def extract_verification_code_unified(
     driver: webdriver.Remote,
     email_addr: str,
@@ -2398,6 +2489,16 @@ def step_verify(
 
     if stop_event and stop_event.is_set():
         raise RuntimeError(ERROR_STOPPED)
+
+    # ============================================================
+    # 开浏览器前先预检 Outlook OAuth token
+    #
+    # 微软大量批量注册邮箱返回 AADSTS70000 (compromised)，
+    # 这类号接码必失败。若不提前拦，会白跑：
+    # 开窗口 + 填表 + 过滑块(实测 23~35 秒) + 占 IP 名额。
+    # ============================================================
+    if not precheck_outlook_oauth(email, password, logger=logger, email_pool=email_pool):
+        raise RuntimeError(f"{ERROR_EMAIL_UNAVAILABLE}: 邮箱OAuth已失效")
 
     if logger:
         logger(f"create_profile {window_name}")
