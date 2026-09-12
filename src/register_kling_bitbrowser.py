@@ -2104,6 +2104,29 @@ def log_response_bodies(
         pass
 
 
+def get_imap_credential(row: Dict[str, Any]) -> str:
+    """
+    取用于邮箱接码（IMAP / OAuth）的凭据。
+
+    优先级与 step_confirm 里的取值保持一致，避免两处不一致导致预检失效：
+        auth_code > 授权码 > authCode > code_url > password > 密码
+
+    Outlook OAuth 号的 auth_code 形如 'client_id|||refresh_token'，
+    注意它 **不在** password 字段里（password 是邮箱登录密码）。
+    """
+    if not isinstance(row, dict):
+        return ""
+    return str(
+        row.get("auth_code")
+        or row.get("授权码")
+        or row.get("authCode")
+        or row.get("code_url")
+        or row.get("password")
+        or row.get("密码")
+        or ""
+    ).strip()
+
+
 def precheck_outlook_oauth(
     email_addr: str,
     password: str,
@@ -2491,14 +2514,17 @@ def step_verify(
         raise RuntimeError(ERROR_STOPPED)
 
     # ============================================================
-    # 开浏览器前先预检 Outlook OAuth token
+    # 开浏览器前再兜一层 OAuth token 预检
     #
-    # 微软大量批量注册邮箱返回 AADSTS70000 (compromised)，
-    # 这类号接码必失败。若不提前拦，会白跑：
-    # 开窗口 + 填表 + 过滑块(实测 23~35 秒) + 占 IP 名额。
+    # 正常情况下 task 层已在分 IP 之前预检过（标记 _oauth_prechecked），
+    # 这里直接跳过，避免重复请求微软接口。
+    # 只有在 step_verify 被单独调用（无 task 层预检）时才真正执行。
     # ============================================================
-    if not precheck_outlook_oauth(email, password, logger=logger, email_pool=email_pool):
-        raise RuntimeError(f"{ERROR_EMAIL_UNAVAILABLE}: 邮箱OAuth已失效")
+    if not row.get("_oauth_prechecked"):
+        if not precheck_outlook_oauth(
+            email, get_imap_credential(row), logger=logger, email_pool=email_pool
+        ):
+            raise RuntimeError(f"{ERROR_EMAIL_UNAVAILABLE}: 邮箱OAuth已失效")
 
     if logger:
         logger(f"create_profile {window_name}")
@@ -4254,6 +4280,19 @@ def run_batch(
                     logger(f"跳过 {email}: 邮箱不可用 ({reason})")
                 r["status"] = "surplus" if "local_status" in reason else "bad"
                 return idx, False, f"email_unavailable_{reason}"
+
+        # ============================================================
+        # 分 IP 之前预检 Outlook OAuth token
+        #
+        # 坏号（微软 AADSTS70000 / account compromised）必须在
+        # 占用 IP 名额之前拦掉，否则每个坏号都要白占一个 IP、
+        # 白开一次浏览器窗口、白过一遍滑块（实测 23~35 秒）。
+        # ============================================================
+        _cred = get_imap_credential(r)
+        if not precheck_outlook_oauth(email, _cred, logger=logger, email_pool=email_pool):
+            r["status"] = "bad"
+            return idx, False, "email_oauth_dead_precheck"
+        r["_oauth_prechecked"] = True
 
         # Mark as processing
         if email_pool:
