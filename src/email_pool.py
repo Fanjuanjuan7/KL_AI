@@ -486,6 +486,65 @@ class EmailPool:
             self._notify_listeners()
         return updated
 
+    def batch_mark_problem(self, items: List[tuple]) -> int:
+        """
+        批量把邮箱标记为「问题邮箱」（一次性落盘、只通知一次）。
+
+        GUI 的邮箱质检一次可能检出上百个坏号，若逐个调用
+        update_email_status，每次都会写盘并触发监听器刷新整张列表，
+        会明显卡界面。这里合并为一次写入、一次通知。
+
+        Args:
+            items: [(email, reason), ...] 邮箱与问题原因
+
+        Returns:
+            实际发生变更的邮箱数量
+        """
+        if not items:
+            return 0
+
+        import time
+
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        reason_map: Dict[str, str] = {}
+        for pair in items:
+            try:
+                _email, _reason = pair[0], pair[1]
+            except (IndexError, TypeError):
+                continue
+            _email = str(_email or "").strip()
+            if not _email:
+                continue
+            reason_map[_email] = str(_reason or "问题邮箱").strip()[:200]
+
+        if not reason_map:
+            return 0
+
+        changed = 0
+        with self._lock:
+            for item in self.emails:
+                email = item.get("email")
+                if email not in reason_map:
+                    continue
+                new_reason = reason_map[email]
+                if (
+                    item.get("status") != EmailStatus.PROBLEM
+                    or item.get("failure_reason") != new_reason
+                ):
+                    item["status"] = EmailStatus.PROBLEM
+                    item["failure_reason"] = new_reason
+                    item["failure_time"] = now
+                    changed += 1
+
+            if changed:
+                self._save_pool()
+
+        # 在锁外通知监听器（只通知一次）
+        if changed:
+            self._notify_listeners()
+
+        return changed
+
     def get_email_config(self, email: str) -> Optional[Dict[str, str]]:
         """
         获取邮箱配置信息。

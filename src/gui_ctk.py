@@ -46,13 +46,25 @@ try:
     from src.email_pool import EmailPool
     from src.health_server import start_health_server
     from src.ip_manager import IPManager
-    from src.register_kling_bitbrowser import RegistrationEvents, read_rows, run_batch
+    from src.register_kling_bitbrowser import (
+        RegistrationEvents,
+        get_imap_credential,
+        precheck_outlook_oauth,
+        read_rows,
+        run_batch,
+    )
 except ImportError:
     # Fallback for direct execution (not recommended but handled)
     from email_pool import EmailPool
     from health_server import start_health_server
     from ip_manager import IPManager
-    from register_kling_bitbrowser import RegistrationEvents, read_rows, run_batch
+    from register_kling_bitbrowser import (
+        RegistrationEvents,
+        get_imap_credential,
+        precheck_outlook_oauth,
+        read_rows,
+        run_batch,
+    )
 
 
 # Dynamic inheritance for DnD support
@@ -1604,6 +1616,18 @@ class App(*BaseClasses):
             hover_color="#d63030",
         ).pack(side="left", padx=6)
 
+        # 邮箱质检：导入邮箱后点一下，OAuth 失效的坏号自动标记为问题邮箱
+        self.btn_healthcheck = ctk.CTkButton(
+            search_frame,
+            text="🔍 一键质检邮箱",
+            command=self.run_email_healthcheck,
+            fg_color="#1F6FEB",
+            hover_color="#1553B7",
+            width=160,
+        )
+        self.btn_healthcheck.pack(side="right", padx=6)
+        self._healthcheck_running = False
+
         # Selection Frame
         select_frame = ctk.CTkFrame(parent)
         select_frame.pack(fill="x", padx=12, pady=(0, 8))
@@ -2293,6 +2317,208 @@ class App(*BaseClasses):
                 )
             except Exception as e:
                 messagebox.showerror("导出失败", f"导出问题邮箱时出错: {e}")
+
+    # =========================================================================
+    # 邮箱质检：一键检出 OAuth 失效号，自动标记为「问题邮箱」
+    # =========================================================================
+    def run_email_healthcheck(self):
+        """
+        一键质检邮箱池：校验每个未完成邮箱的 OAuth token 是否仍然有效。
+
+        背景：微软对批量注册的邮箱常返回 AADSTS70000（账号被判定已泄露），
+        这类号接码必然失败。此前要白开窗口 + 填表 + 过滑块(实测 23~35 秒)
+        + 占用一个 IP 名额，最后才在接码阶段炸掉。
+
+        质检只做只读校验、不删除任何邮箱；检出失效的号自动标记为
+        「问题邮箱」，注册流程会自动跳过它们。
+        """
+        if getattr(self, "_healthcheck_running", False):
+            messagebox.showinfo("提示", "邮箱质检正在进行中，请等待本轮结束。")
+            return
+
+        try:
+            rows = self.email_pool.get_all_rows()
+        except Exception as e:
+            messagebox.showerror("质检失败", f"读取邮箱池出错: {e}")
+            return
+
+        if not rows:
+            messagebox.showinfo("提示", "邮箱池是空的，请先导入邮箱。")
+            return
+
+        # 只检"还没有结论"的号：new / failed / stopped 等
+        already_settled = {
+            "success",
+            "registered",
+            "submitted",
+            "used",
+            "problem",
+            "processing",
+            "disabled",
+            "invalid",
+            "banned",
+        }
+        targets = []
+        skipped = 0
+        for r in rows:
+            status = str(r.get("status") or "new").strip().lower() or "new"
+            cred = get_imap_credential(r)
+            if status in already_settled or "|||" not in cred:
+                skipped += 1
+                continue
+            targets.append((str(r.get("email") or "").strip(), cred))
+
+        if not targets:
+            messagebox.showinfo(
+                "提示",
+                f"没有需要质检的邮箱。\n\n"
+                f"共 {len(rows)} 个，跳过 {skipped} 个"
+                f"（已成功 / 已标记问题 / 非 OAuth 格式）。",
+            )
+            return
+
+        if not messagebox.askyesno(
+            "邮箱质检",
+            f"即将质检 {len(targets)} 个邮箱（未完成的号）。\n"
+            f"跳过 {skipped} 个（已成功 / 已标记问题 / 非 OAuth 格式）。\n\n"
+            f"质检只校验、不删号；检出失效的邮箱会自动标记为\n"
+            f"「🔶 问题邮箱」，注册时自动跳过，不再白开窗口、白过滑块。\n\n"
+            f"是否开始？",
+        ):
+            return
+
+        self._healthcheck_running = True
+        try:
+            self.btn_healthcheck.configure(
+                state="disabled", text=f"⏳ 质检中 0/{len(targets)}"
+            )
+        except Exception:
+            pass
+
+        self.append_log(
+            f"🔍 邮箱质检开始：待检 {len(targets)} 个，跳过 {skipped} 个（10 并发，每号约 1 秒）"
+        )
+        threading.Thread(
+            target=self._email_healthcheck_worker, args=(targets,), daemon=True
+        ).start()
+
+    def _email_healthcheck_worker(self, targets):
+        """后台执行邮箱质检，不阻塞界面。"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        total = len(targets)
+        bad = []
+        checked = 0
+        t0 = time.time()
+
+        def _check(item):
+            email, cred = item
+            logs = []
+            try:
+                ok = precheck_outlook_oauth(email, cred, logger=logs.append)
+                if ok is False:
+                    reason = ""
+                    for msg in logs:
+                        if "->" in msg:
+                            reason = msg.split("->", 1)[1].strip()
+                    return email, False, reason or "OAuth token 已失效"
+                return email, True, ""
+            except Exception as e:
+                # 质检自身异常不判死刑，避免网络抖动误杀好号
+                return email, None, f"质检异常: {e}"
+
+        try:
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                futures = [executor.submit(_check, t) for t in targets]
+                for future in as_completed(futures):
+                    email, ok, reason = future.result()
+                    checked += 1
+                    if ok is False:
+                        bad.append((email, reason))
+                        self._run_on_ui(self.append_log, f"🔶 检出问题邮箱: {email}")
+                    if checked % 25 == 0 or checked == total:
+                        self._run_on_ui(
+                            lambda txt=f"⏳ 质检中 {checked}/{total}": (
+                                self.btn_healthcheck.configure(text=txt)
+                            )
+                        )
+                        self._last_worker_heartbeat = time.time()
+        except Exception as e:
+            self._run_on_ui(self.append_log, f"邮箱质检异常中断: {e}")
+
+        marked = 0
+        if bad:
+            try:
+                marked = self.email_pool.batch_mark_problem(
+                    [(e, f"邮箱质检: {r}") for e, r in bad]
+                )
+            except Exception as e:
+                self._run_on_ui(self.append_log, f"标记问题邮箱失败: {e}")
+
+        report_path = self._write_healthcheck_report(bad)
+        self._run_on_ui(
+            self._email_healthcheck_done,
+            checked,
+            marked,
+            bad,
+            time.time() - t0,
+            report_path,
+        )
+
+    def _write_healthcheck_report(self, bad):
+        """把质检检出的坏号写成清单，方便留档或找卖号的换号。"""
+        if not bad:
+            return ""
+        try:
+            log_dir = os.path.join(self.project_root, "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(log_dir, f"email_healthcheck_{stamp}.csv")
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(["邮箱", "质检结果", "问题原因"])
+                for email, reason in bad:
+                    writer.writerow([email, "已废(token失效)", reason])
+            return path
+        except Exception:
+            return ""
+
+    def _email_healthcheck_done(self, checked, marked, bad_list, elapsed, report_path):
+        """质检结束：回到主线程刷新界面并汇报结果。"""
+        self._healthcheck_running = False
+        try:
+            self.btn_healthcheck.configure(state="normal", text="🔍 一键质检邮箱")
+        except Exception:
+            pass
+
+        good = checked - len(bad_list)
+        self._update_email_list_ui()
+        self.trigger_refresh(force=True)
+
+        self.append_log(
+            f"✅ 邮箱质检完成：共检 {checked} 个，可用 {good} 个，"
+            f"标记问题邮箱 {marked} 个，耗时 {elapsed:.0f} 秒"
+        )
+        if report_path:
+            self.append_log(f"质检清单已保存: {report_path}")
+
+        if not bad_list:
+            messagebox.showinfo(
+                "质检完成",
+                f"全部 {checked} 个邮箱可用，没发现问题。\n\n耗时 {elapsed:.0f} 秒。",
+            )
+            return
+
+        head = "\n".join(f"  • {e}" for e, _ in bad_list[:8])
+        more = f"\n  • ...另有 {len(bad_list) - 8} 个" if len(bad_list) > 8 else ""
+        tail = f"\n\n完整清单：{report_path}" if report_path else ""
+        messagebox.showwarning(
+            "质检完成",
+            f"共检 {checked} 个邮箱，其中 {marked} 个 OAuth 已失效，\n"
+            f"已标记为「🔶 问题邮箱」，注册时会自动跳过。\n\n"
+            f"可用 {good} 个，耗时 {elapsed:.0f} 秒。\n\n"
+            f"问题邮箱示例：\n{head}{more}{tail}",
+        )
 
     def search_email_url(self):
         query = self.email_search_var.get().strip()
