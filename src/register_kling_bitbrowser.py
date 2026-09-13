@@ -3884,21 +3884,11 @@ def step_confirm(
     )
 
     if not code:
-        # User Request: Mark as problem email and release resources
-        if email_pool:
-            try:
-                email = str(row.get("email") or row.get("账号") or "")
-                # Mark as 'problem' with reason
-                email_pool.update_email_status(
-                    email, "problem", reason="验证码获取超时 (3次重试)"
-                )
-                ctx["failure_status_set"] = True
-                if logger:
-                    logger(f"已标记为问题邮箱 (fail_code_timeout): {email}")
-            except Exception as e:
-                if logger:
-                    logger(f"标记问题邮箱失败: {e}")
-
+        # 注意：拿到验证码失败 ≠ 邮箱有问题。
+        # 绝大多数情况是"表单根本没提交成功"（验证码/滑块没过），
+        # 这时把邮箱标记为 problem 会白白烧掉好号。
+        # 邮箱自身的问题（OAuth 失效、IMAP 登录失败）在 extract_verification_code_unified
+        # 内部已经用 _mark_problem 标记过了，这里不再重复标记。
         if logger:
             logger("步骤: 获取验证码失败(超时)")
         # Diagnosis

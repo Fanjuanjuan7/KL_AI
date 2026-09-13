@@ -2887,18 +2887,33 @@ class App(*BaseClasses):
 
                 # Registration events for handling failures (especially captcha-related)
                 def on_registration_failure(email: str, reason: str):
-                    """Handle registration failure - mark email as problem if captcha-related."""
-                    # Check if failure is captcha-related
-                    captcha_errors = [
-                        "code_not_found",
-                        "code_input_not_visible",
-                        "code_input_error",
-                    ]
-                    if any(err in reason.lower() for err in captcha_errors):
+                    """注册失败回调。
+
+                    两件事：
+                    1) 不按失败字符串把邮箱标记为 problem。
+                       「验证码没拿到 / 滑块没过」是流程问题，不是邮箱问题，
+                       之前按字符串匹配标记会白白烧掉好邮箱（实测一批 4 个全被误标）。
+                       邮箱自身的问题（OAuth 失效、IMAP 登录失败）在
+                       register_kling_bitbrowser 内部已用 _mark_problem 精确标记。
+                    2) 把邮箱从 processing 释放回 failed（可重试）。
+                       否则任务失败后邮箱会永久卡在"处理中"，再也不会被选中重跑。
+                    """
+                    lower = reason.lower()
+                    flow_errors = ("code_not_found", "code_input_not_visible",
+                                   "code_input_error", "slider_failed",
+                                   "slider_reappeared", "next_click_failed",
+                                   "timed out", "timeout")
+                    if any(err in lower for err in flow_errors):
                         self.append_log(
-                            f"邮箱 {email} 因验证码问题被标记为问题邮箱: {reason}"
+                            f"⚠️ {email} 本次未完成（{reason}）——流程问题，邮箱不标记为问题号"
                         )
-                        self.email_pool.update_status(email, "problem")
+                        try:
+                            cfg = self.email_pool.get_email_config(email) or {}
+                            if str(cfg.get("status") or "").strip().lower() == "processing":
+                                self.email_pool.update_status(email, "failed")
+                                self.append_log(f"♻️ {email} 已释放为 failed，后续可重试")
+                        except Exception as e:
+                            self.append_log(f"释放邮箱状态失败: {e}")
 
                 def on_registration_success(email: str):
                     """Handle registration success."""
